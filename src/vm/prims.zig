@@ -40,12 +40,20 @@ const symbols = @import("symbols.zig");
 const interp = @import("interp.zig");
 const streams = @import("streams.zig");
 const execplan = @import("execplan.zig");
+const marshal = @import("marshal.zig");
+const hostcall = @import("hostcall.zig");
 
 const Gc = gc.Gc;
 const Value = types.Value;
 const ValueArray = types.ValueArray;
 const Vm = state.Vm;
 const VmError = state.VmError;
+
+/// wait/kill libc externs (the Shen OS wait/kill prims, ported here because
+/// execplan.zig's copies are file-private and out of scope this phase).
+/// Native-only: the vm module links libc.
+extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
+extern "c" fn kill(pid: c_int, sig: c_int) c_int;
 
 /// The handler shape shared by the table and the dispatcher.
 pub const PrimFn = *const fn (vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void;
@@ -118,8 +126,11 @@ pub const prim_table = [_]PrimDef{
     .{ .name = "read-file-as-string", .arity = 1, .func = streams.primReadFileAsString },
     .{ .name = "open", .arity = 2, .func = streams.primOpen },
     .{ .name = "close", .arity = 1, .func = streams.primClose },
-    // ---- process execution (M8, execplan.zig; B: no wait/kill) ----
+    // ---- process execution (M8, execplan.zig; wait/kill are Shen OS-only,
+    //      ported from shen into prims.zig since execplan.zig is frozen) ----
     .{ .name = "exec-plan", .arity = 1, .func = execplan.primExecPlan },
+    .{ .name = "wait", .arity = 1, .func = primWait },
+    .{ .name = "kill", .arity = 2, .func = primKill },
     .{ .name = "cd", .arity = 1, .func = execplan.primCd },
     .{ .name = "getcwd", .arity = 0, .func = execplan.primGetcwd },
     .{ .name = "getpid", .arity = 0, .func = execplan.primGetpid },
@@ -130,6 +141,9 @@ pub const prim_table = [_]PrimDef{
     .{ .name = "trap-error", .arity = 2, .func = primTrapError },
     .{ .name = "simple-error", .arity = 1, .func = primSimpleError },
     .{ .name = "error-to-string", .arity = 1, .func = primErrorToString },
+    // ---- eval-kl (Shen OS M2, marshal.zig + hostcall.zig): the
+    //      bundle-driven compile+run chain.
+    .{ .name = "eval-kl", .arity = 1, .func = primEvalKl },
     .{ .name = "get-time", .arity = 1, .func = primGetTime },
     .{ .name = "intern", .arity = 1, .func = primIntern },
     .{ .name = "set", .arity = 2, .func = primSet },
@@ -420,6 +434,96 @@ fn primErrorToString(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     } else {
         acc.* = values.valString(g, "unknown error");
     }
+}
+
+// =====================================================================
+//  'e': eval-kl — the bundle-driven compile+run chain (Shen OS M2)
+// =====================================================================
+
+/// One eval-kl chain stage (C:2012-2017 extract-kl / :2028-2033 kl->zinc /
+/// :2044-2049 toplevel-interp): resolve the bundled closure; a non-lambda
+/// resolution warns on stderr and reports missing (null), else the stage
+/// runs through the shared hostcall env-extend pattern.  `arg` must be a
+/// rooted slot (the caller's chain roots).
+fn evalKlStage(vm: *Vm, name: []const u8, arg: *Value) VmError!?Value {
+    if (vm.defunGet(name).tag != .lambda) {
+        std.debug.print("runtime: eval-kl: {s} not found in bundle\n", .{name});
+        return null;
+    }
+    return hostcall.applyBundledN(vm, name, &.{arg.*});
+}
+
+/// The compile+run chain (C:2009-2060): marshal_to_tagged → extract-kl →
+/// kl->zinc → toplevel-interp → demarshal_from_tagged — the first
+/// bundle-scale execution path.  `a` (the input form) must ALREADY be rooted
+/// by the caller.  Every intermediate is rooted exactly as C roots it
+/// (tagged C:2010, the three closures ride applyBundledN's internal fn
+/// root, klambda C:2026, zinc_code C:2042, tagged_result C:2058); the roots
+/// are deliberately NOT popped here — the caller's single defer
+/// rootPopTo(entry_wm) is the pop site (C's one gc_root_pop_to(eval_kl_wm)
+/// at eval_kl_done, :2063/:2068 — a Zig defer replaces C's two-path pop_to
+/// since error unwinding runs intermediate defers).  Returns null when a
+/// bundle closure is missing (warned in evalKlStage; C jumps to
+/// eval_kl_done with result = a).
+fn evalKlChain(vm: *Vm, a: *Value) VmError!?Value {
+    const g = vm.gc;
+    var tagged = marshal.marshalToTagged(vm, a.*);
+    g.rootPushValue(&tagged); // C:2010
+
+    var klambda = (try evalKlStage(vm, "extract-kl", &tagged)) orelse return null;
+    g.rootPushValue(&klambda); // C:2026
+
+    var zinc_code = (try evalKlStage(vm, "kl->zinc", &klambda)) orelse return null;
+    g.rootPushValue(&zinc_code); // C:2042
+
+    var tagged_result = (try evalKlStage(vm, "toplevel-interp", &zinc_code)) orelse return null;
+    g.rootPushValue(&tagged_result); // C:2058
+
+    return marshal.demarshalFromTagged(vm, tagged_result); // C:2060
+}
+
+/// C: zincvm.c:1999-2082 eval-kl — THE bundle-scale execution path.  C's
+/// volatile-locals + setjmp/longjmp dance collapses to plain locals + roots
+/// + `catch` (plan DECISION A):
+///   - CatchSite with in_trap_error = 0 wraps the WHOLE chain (C:2001-2004)
+///     so a throw anywhere lands here, not in an outer handler;
+///   - the popped form is rooted and the entry watermark + defer rootPopTo
+///     replace C's eval_kl_wm + two-path pop_to (:2006/:2063/:2068);
+///   - CRITICAL SEMANTIC (C:2070-2081): eval-kl RETURNS error values — on a
+///     thrown ShenError, acc = vm.err_slot (the once-rooted DECISION-A
+///     replacement for C's cf.error_val + S3 root dance) and the prim
+///     SUCCEEDS; the error is never re-propagated as a VmError.  shensh's
+///     eval_kl_form relies on this (exec_primitive's return is ignored).
+/// PORT-FIX (deliberate deviation): C leaves the input form `a` unrooted —
+/// its own :2070-2076 comment documents how the old `*acc = result = a`
+/// echo read garbage after a collection moved the form's cells.  The port
+/// roots `a`, so the missing-closure fallback (result = a, C goto
+/// eval_kl_done) is collector-safe.
+fn primEvalKl(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    const g = vm.gc;
+    var a = interp.vaPop(stack);
+    const entry_wm = g.rootWatermark(); // C:2006 eval_kl_wm
+    var site = state.CatchSite{ .in_trap_error = false, .parent = vm.catch_chain }; // C:2001-2003
+    vm.catch_chain = &site;
+    g.rootPushValue(&a); // PORT-FIX root (see doc)
+    defer g.rootPopTo(entry_wm); // the ONE pop site — runs LAST (C:2063/:2068)
+    defer vm.catch_chain = site.parent; // C:2064/:2069
+
+    // C:2005 `volatile Value result = a` — the missing-closure fallback,
+    // now read through the rooted `a`.
+    var result: Value = a;
+    if (evalKlChain(vm, &a)) |maybe| {
+        if (maybe) |v| result = v;
+        // null: a bundle closure missing — result stays the input form
+        // (warned in evalKlStage; C goto eval_kl_done).
+    } else |e| switch (e) {
+        // C:2077-2081: propagate the real error VALUE, not the input form.
+        error.ShenError => result = vm.err_slot,
+        // vmExecEnv never propagates Halt (the eval loop contains it at its
+        // own call sites); C has no equivalent arm.  Kept for exhaustiveness.
+        error.Halt => return error.Halt,
+    }
+    acc.* = result; // C:2065/:2079 `*acc = result/errv; return 0`
 }
 
 /// C: zincvm.c:1984-1998 element? — deep_equal list membership.  Alloc-free;
@@ -1251,4 +1355,30 @@ fn primAtP(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
     acc.* = values.valCons(vm.gc, a1, a2);
+}
+
+// =====================================================================
+//  wait / kill — the Shen OS process prims (C: zincvm.c:2693-2700 /
+//  :2294-2299).  Ported into prims.zig (not execplan.zig) because
+//  execplan.zig is frozen this phase; the libc externs are declared at the
+//  top of this file and waitStatusCode is shared via execplan.
+// =====================================================================
+
+/// C: zincvm.c:2294-2299 kill.  ZINC RTL: a1 = leftmost = Pid (popped
+/// FIRST), a2 = Sig.
+fn primKill(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
+    const pidv = interp.vaPop(stack);
+    const sigv = interp.vaPop(stack);
+    _ = kill(@truncate(pidv.payload.number), @truncate(sigv.payload.number));
+    acc.* = values.valBoolean(true);
+}
+
+/// C: zincvm.c:2693-2700 wait: Pid -> exit status (raw number).
+fn primWait(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    const pidv = interp.vaPop(stack);
+    if (pidv.tag != .number) return vm.throwShen("wait: pid must be a number");
+    var st: c_int = 0;
+    _ = waitpid(@truncate(pidv.payload.number), &st, 0);
+    acc.* = values.valNumber(execplan.waitStatusCode(@bitCast(st)));
 }

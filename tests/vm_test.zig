@@ -3227,3 +3227,250 @@ test "M11 tail-env reuse: interactions (peel, trap-error, partial)" {
 
     try std.testing.expectEqual(wm0, g.rootWatermark());
 }
+
+// =====================================================================
+//  Ported from shen — M2 marshal/demarshal + eval-kl (no-bundle) and the
+//  M3 wait/kill process gate.  Self-contained (no bundle artifact); the
+//  bundle-driven M2 zinctest parity cases stay shen-side.
+// =====================================================================
+
+// ---- raw libc for the M3 wait/kill test ----
+// fork/_exit/nanosleep: the test binary links libc (via the vm module).  The
+// fork/_exit externs are file-private in execplan.zig, so re-declare here.
+const Timespec = extern struct { sec: isize, nsec: isize };
+extern "c" fn nanosleep(req: *const Timespec, rem: ?*Timespec) c_int;
+extern "c" fn fork() c_int;
+extern "c" fn _exit(code: c_int) noreturn;
+
+fn sleepSec(sec: isize) void {
+    const ts = Timespec{ .sec = sec, .nsec = 0 };
+    _ = nanosleep(&ts, null);
+}
+
+fn sleepMs(ms: u64) void {
+    const ts = Timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+    _ = nanosleep(&ts, null);
+}
+
+/// Deterministic LCG for the property test (std.rand is thread-scoped and
+/// heavyweight for a test; a plain PCG-style step is enough here).
+fn m2NextRand(rng: *u64) u64 {
+    rng.* = rng.* *% 6364136223846793005 +% 1442695040888963407;
+    return rng.* >> 33;
+}
+
+/// Build a random tree with leaves from {number, string, boolean, nil,
+/// symbol foo|bar|quux} and cons nodes.  SYMBOLS ARE SAFE IN CAR POSITIONS:
+/// the demarshal protocol only special-cases the five reserved tag symbols
+/// (number/symbol/string/boolean/cons) and 'mark' — none of which this
+/// generator can emit — so every generated tree is a fixed point of
+/// demarshal∘marshal (the round-trip property under test).  The car is
+/// rooted across the cdr build (valCons roots its own params internally).
+fn m2BuildTree(v: *state.Vm, rng: *u64, depth: u32, counter: *u32) types.Value {
+    const g = v.gc;
+    if (depth == 0 or m2NextRand(rng) % 5 == 0) {
+        switch (m2NextRand(rng) % 5) {
+            0 => return values.valNumber(@intCast(m2NextRand(rng) % 1000)),
+            1 => {
+                var buf: [24]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "s{d}", .{counter.*}) catch unreachable;
+                counter.* += 1;
+                return values.valString(g, s);
+            },
+            2 => return values.valBoolean(m2NextRand(rng) % 2 == 0),
+            3 => return values.valNil(),
+            else => return switch (m2NextRand(rng) % 3) {
+                0 => symbols.valSymbol(&v.symbols, "foo"),
+                1 => symbols.valSymbol(&v.symbols, "bar"),
+                else => symbols.valSymbol(&v.symbols, "quux"),
+            },
+        }
+    }
+    var car = m2BuildTree(v, rng, depth - 1, counter);
+    var car_guard = g.rootValue(&car);
+    defer car_guard.end();
+    const cdr = m2BuildTree(v, rng, depth - 1, counter);
+    return values.valCons(g, car, cdr);
+}
+
+/// Build a proper list [i0 i1 ... ik] from values (the eval-kl form
+/// builder).  The items are copied into a rooted buffer so string items
+/// survive the valCons churn (numbers/symbols carry no GC interiors, but
+/// strings do).
+fn m2List(g: *heap.Gc, items: []const types.Value) types.Value {
+    var buf: [16]types.Value = undefined;
+    var n: i32 = @intCast(items.len);
+    for (items, 0..) |it, idx| buf[idx] = it;
+    g.rootPushValueArray(&buf, &n);
+    defer g.rootPop();
+    var head = values.valNil();
+    var guard = g.rootValue(&head);
+    defer guard.end();
+    var i: usize = items.len;
+    while (i > 0) {
+        i -= 1;
+        head = values.valCons(g, buf[i], head);
+    }
+    return head;
+}
+
+test "M2 marshal/demarshal: scalar tags, [cons] empty, mark, passthroughs" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // [number 5] shape: cons(symbol number, cons(5, nil)); round-trips.
+    const m5 = vm.marshal.marshalToTagged(&v, values.valNumber(5));
+    try std.testing.expectEqual(types.ValTag.cons, m5.tag);
+    try std.testing.expectEqualStrings("number", values.symSlice(m5.payload.cons.car.?.*));
+    const cdr5 = m5.payload.cons.cdr.?.*;
+    try std.testing.expectEqual(@as(i64, 5), cdr5.payload.cons.car.?.payload.number);
+    try std.testing.expectEqual(types.ValTag.nil, cdr5.payload.cons.cdr.?.tag);
+    try std.testing.expectEqual(@as(i64, 5), vm.marshal.demarshalFromTagged(&v, m5).payload.number);
+
+    // Strings / symbols / booleans round-trip through their tags.
+    const ms = vm.marshal.marshalToTagged(&v, values.valString(&g, "ab"));
+    try std.testing.expectEqualStrings("ab", values.strSlice(vm.marshal.demarshalFromTagged(&v, ms)));
+    const msym = vm.marshal.marshalToTagged(&v, symbols.valSymbol(&v.symbols, "foo"));
+    try std.testing.expectEqualStrings("foo", values.symSlice(vm.marshal.demarshalFromTagged(&v, msym)));
+    const mb = vm.marshal.marshalToTagged(&v, values.valBoolean(true));
+    try std.testing.expectEqual(@as(i64, 1), vm.marshal.demarshalFromTagged(&v, mb).payload.boolean);
+
+    // nil marshals to [cons] (symbol cons + nil cdr) and demarshals back.
+    const mnil = vm.marshal.marshalToTagged(&v, values.valNil());
+    try std.testing.expectEqualStrings("cons", values.symSlice(mnil.payload.cons.car.?.*));
+    try std.testing.expectEqual(types.ValTag.nil, mnil.payload.cons.cdr.?.tag);
+    try std.testing.expectEqual(types.ValTag.nil, vm.marshal.demarshalFromTagged(&v, mnil).tag);
+
+    // mark marshals to the SYMBOL 'mark; the symbol 'mark demarshals to nil.
+    const mmark = vm.marshal.marshalToTagged(&v, values.valMark());
+    try std.testing.expectEqual(types.ValTag.symbol, mmark.tag);
+    try std.testing.expectEqualStrings("mark", values.symSlice(mmark));
+    try std.testing.expectEqual(types.ValTag.nil, vm.marshal.demarshalFromTagged(&v, symbols.valSymbol(&v.symbols, "mark")).tag);
+
+    // Lambdas / vectors / errors pass through BOTH directions unchanged.
+    const lam = values.valLambda(&g, null, 0, null, 0);
+    try std.testing.expectEqual(types.ValTag.lambda, vm.marshal.marshalToTagged(&v, lam).tag);
+    try std.testing.expectEqual(types.ValTag.lambda, vm.marshal.demarshalFromTagged(&v, lam).tag);
+    const vec = values.valVector(&g, 2);
+    try std.testing.expectEqual(types.ValTag.vector, vm.marshal.marshalToTagged(&v, vec).tag);
+    const errv = values.valError(&g, "boom");
+    try std.testing.expectEqual(types.ValTag.error_, vm.marshal.demarshalFromTagged(&v, errv).tag);
+
+    // marshal of a cons is the 3-ELEMENT LIST [cons X Y] with RAW car/cdr
+    // (the no-recursion rule, C:763-767): cadr is the raw number 1, and the
+    // actual cdr rides in a SINGLETON wrapper (the 3rd element is (2 nil)).
+    var pair = values.valCons(&g, values.valNumber(1), values.valNumber(2));
+    var pair_guard = g.rootValue(&pair);
+    defer pair_guard.end();
+    const mp = vm.marshal.marshalToTagged(&v, pair);
+    try std.testing.expectEqualStrings("cons", values.symSlice(mp.payload.cons.car.?.*));
+    const mp_cdr = mp.payload.cons.cdr.?.*; // (1 (2 nil))
+    try std.testing.expectEqual(@as(i64, 1), mp_cdr.payload.cons.car.?.payload.number); // RAW 1
+    const wrapper = mp_cdr.payload.cons.cdr.?.*; // ((2 nil))
+    try std.testing.expectEqual(types.ValTag.cons, wrapper.tag);
+    try std.testing.expectEqual(@as(i64, 2), wrapper.payload.cons.car.?.payload.number); // RAW 2
+    try std.testing.expectEqual(types.ValTag.nil, wrapper.payload.cons.cdr.?.tag);
+    // ...and demarshal rebuilds the DOTTED pair cons(1 . 2).
+    const back = vm.marshal.demarshalFromTagged(&v, mp);
+    try std.testing.expect(values.deepEqual(pair, back, 0));
+    try std.testing.expectEqual(types.ValTag.number, back.payload.cons.cdr.?.tag);
+}
+
+test "M2 marshal/demarshal round-trip property: random nested cons trees" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    var rng: u64 = 0x5eed_cafe_f00d;
+    var counter: u32 = 0;
+    var iter: usize = 0;
+    while (iter < 64) : (iter += 1) {
+        var tree = m2BuildTree(&v, &rng, 4, &counter);
+        var tree_guard = g.rootValue(&tree);
+        defer tree_guard.end();
+
+        var tagged = vm.marshal.marshalToTagged(&v, tree);
+        var tagged_guard = g.rootValue(&tagged);
+        defer tagged_guard.end();
+
+        // Churn + a forced scavenge BETWEEN marshal and demarshal: the
+        // tagged form survives only via its root (its cons car/cdr interior
+        // pointers must be re-read fresh through the rooted slot).
+        var junk = values.valNil();
+        var junk_guard = g.rootValue(&junk);
+        defer junk_guard.end();
+        var k: usize = 0;
+        while (k < 200) : (k += 1)
+            junk = values.valCons(&g, values.valNumber(@intCast(k)), junk);
+        g.collectNursery(.@"test");
+
+        var back = vm.marshal.demarshalFromTagged(&v, tagged);
+        var back_guard = g.rootValue(&back);
+        defer back_guard.end();
+        try std.testing.expect(values.deepEqual(tree, back, 0));
+    }
+}
+
+test "M2 eval-kl without a bundle: missing closure returns the input form" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // No loadBundle: extract-kl resolves to a bare symbol (defunGet's
+    // fallback), the stage warns on stderr, and eval-kl's acc is the INPUT
+    // FORM (C goto eval_kl_done with result = a).
+    var form = m2List(&g, &.{ symbols.valSymbol(&v.symbols, "+"), values.valNumber(1), values.valNumber(2) });
+    var acc: types.Value = values.valNil();
+    try primExecRooted(&g, &v, "eval-kl", &form, &acc);
+    try std.testing.expect(values.deepEqual(form, acc, 0));
+
+    // Scalar forms too (marshal still runs first, then the fallback).
+    var form2 = values.valNumber(42);
+    try primExecRooted(&g, &v, "eval-kl", &form2, &acc);
+    try std.testing.expectEqual(@as(i64, 42), acc.payload.number);
+}
+
+test "M3 gate: wait returns the child's exit code; kill -> 128+sig" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // wait: fork -> child _exit(42) -> primWait reports 42.
+    {
+        const pid = fork();
+        try std.testing.expect(pid != -1);
+        if (pid == 0) _exit(42);
+        var acc: types.Value = values.valNil();
+        try primExec(&g, &v, "wait", &.{values.valNumber(pid)}, &acc);
+        try std.testing.expectEqual(types.ValTag.number, acc.tag);
+        try std.testing.expectEqual(@as(i64, 42), acc.payload.number);
+    }
+
+    // kill: fork -> child sleeps 30s -> SIGKILL (9) -> wait -> 128+9 = 137.
+    {
+        const pid = fork();
+        try std.testing.expect(pid != -1);
+        if (pid == 0) {
+            // The child never touches the GC heap — it only sleeps (the
+            // same discipline the runner's children follow).
+            sleepSec(30);
+            _exit(0);
+        }
+        sleepMs(100); // let the child reach nanosleep
+        var kacc: types.Value = values.valNil();
+        try primExec(&g, &v, "kill", &.{ values.valNumber(pid), values.valNumber(9) }, &kacc);
+        try std.testing.expectEqual(types.ValTag.boolean, kacc.tag);
+        var wacc: types.Value = values.valNil();
+        try primExec(&g, &v, "wait", &.{values.valNumber(pid)}, &wacc);
+        try std.testing.expectEqual(@as(i64, 137), wacc.payload.number);
+    }
+}
