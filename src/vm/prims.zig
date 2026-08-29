@@ -1126,55 +1126,47 @@ fn primVariableP(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
 ///
 /// M4 runtime tag dispatch: (Int,Int) stays wrapping Int; any Float operand
 /// promotes Int->Float and computes in f64 (Elm numeric-literal polymorphism:
-/// 1 + 2.5 = 3.5).  Non-numeric operands throwShen (the guard replaces the
-/// C's silent union-field read on the untyped operand).
+/// 1 + 2.5 = 3.5).  NO type guard — bare arithmetic reads the number bits
+/// directly (shen semantics, AGENTS.md; the metacircular interpreter relies
+/// on it), while Float operands promote as fx-ui's M4 requires.
 fn primAdd(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    if ((a1.tag == .float or a1.tag == .number) and
-        (a2.tag == .float or a2.tag == .number))
-    {
-        if (a1.tag == .float or a2.tag == .float) {
-            acc.* = values.valFloat(asFloat(a1) + asFloat(a2));
-        } else {
-            acc.* = values.valNumber(a1.payload.number +% a2.payload.number);
-        }
+    // Bare arithmetic (shen semantics, AGENTS.md): NO type guard — the
+    // metacircular interpreter passes Shen-level values the safe-wrapper
+    // layer has validated, and shen's VM reads the number bits directly.
+    // Float support (fx-ui M4): promote when either operand is a float.
+    if (a1.tag == .float or a2.tag == .float) {
+        acc.* = values.valFloat(asFloat(a1) + asFloat(a2));
     } else {
-        return vm.throwShen("attempt to apply arithmetic to a non-number");
+        acc.* = values.valNumber(a1.payload.number +% a2.payload.number);
     }
 }
 
 /// C: zincvm.c:2748-2751 -.
 fn primSub(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    if ((a1.tag == .float or a1.tag == .number) and
-        (a2.tag == .float or a2.tag == .number))
-    {
-        if (a1.tag == .float or a2.tag == .float) {
-            acc.* = values.valFloat(asFloat(a1) - asFloat(a2));
-        } else {
-            acc.* = values.valNumber(a1.payload.number -% a2.payload.number);
-        }
+    // Bare arithmetic (shen semantics, AGENTS.md): no type guard.
+    if (a1.tag == .float or a2.tag == .float) {
+        acc.* = values.valFloat(asFloat(a1) - asFloat(a2));
     } else {
-        return vm.throwShen("attempt to apply arithmetic to a non-number");
+        acc.* = values.valNumber(a1.payload.number -% a2.payload.number);
     }
 }
 
 /// C: zincvm.c:2753-2756 *.
 fn primMul(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    if ((a1.tag == .float or a1.tag == .number) and
-        (a2.tag == .float or a2.tag == .number))
-    {
-        if (a1.tag == .float or a2.tag == .float) {
-            acc.* = values.valFloat(asFloat(a1) * asFloat(a2));
-        } else {
-            acc.* = values.valNumber(a1.payload.number *% a2.payload.number);
-        }
+    // Bare arithmetic (shen semantics, AGENTS.md): no type guard.
+    if (a1.tag == .float or a2.tag == .float) {
+        acc.* = values.valFloat(asFloat(a1) * asFloat(a2));
     } else {
-        return vm.throwShen("attempt to apply arithmetic to a non-number");
+        acc.* = values.valNumber(a1.payload.number *% a2.payload.number);
     }
 }
 
@@ -1182,27 +1174,22 @@ fn primMul(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
 /// `//` from float `/`; the latter is the separate `f/` prim).  Division by
 /// zero traps (C: SIGFPE; Zig: panic).
 fn primDiv(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    if (a1.tag == .number and a2.tag == .number) {
-        acc.* = values.valNumber(@divTrunc(a1.payload.number, a2.payload.number));
-    } else {
-        return vm.throwShen("attempt to apply arithmetic to a non-number");
-    }
+    // Bare integer division (shen semantics, AGENTS.md): no type guard.
+    acc.* = values.valNumber(@divTrunc(a1.payload.number, a2.payload.number));
 }
 
 /// M4 `f/` — Elm `/`: ALWAYS f64 division, promoting Int->Float so 2 / 3 =
 /// 0.666... (and x / 0.0 = Infinity, matching Elm's float division).
 fn primFdiv(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    if ((a1.tag == .float or a1.tag == .number) and
-        (a2.tag == .float or a2.tag == .number))
-    {
-        acc.* = values.valFloat(asFloat(a1) / asFloat(a2));
-    } else {
-        return vm.throwShen("attempt to apply arithmetic to a non-number");
-    }
+    // ALWAYS float division (fx-ui M4); no int type guard — f/ is the
+    // dedicated float-division prim (shen has no f/; this is fx-ui-only).
+    acc.* = values.valFloat(asFloat(a1) / asFloat(a2));
 }
 
 /// M4 numeric promote: a .number/.float Value as f64.  Callers guarantee the
