@@ -22,4 +22,3 @@ pub const streams = @import("vm/streams.zig");
 pub const execplan = @import("vm/execplan.zig");
 pub const hostcall = @import("vm/hostcall.zig");
 pub const marshal = @import("vm/marshal.zig");
-pub const effectloop = @import("vm/effectloop.zig");
