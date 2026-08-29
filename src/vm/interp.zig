@@ -360,6 +360,22 @@ fn buildPartialClosure(g: *Gc, fnv_slot: *Value, argbuf: [*]Value, nargs: i32) V
         new_code[0..@as(usize, @intCast(new_len))],
         src[@intCast(nargs)..@intCast(code_len)],
     );
+    // Drop-grabs shifts instruction positions by -nargs, so the absolute
+    // jmp/jmpf targets (resolved at Emit time against the grab-INCLUSIVE
+    // layout) must be rebased to the grab-EXCLUSIVE suffix layout here.
+    //   - Access operands are env indices; env = closure_env ++ argbuf
+    //     preserves the layout — do NOT touch them.
+    //   - Nested cur bodies have their own label spaces and never shift.
+    //   - Compiler guarantee (compileOne/emitLambda/ctorEntry/wrappers all
+    //     emit grabs++body with labels only inside the body): every target
+    //     lives in [nargs, code_len); the @max(0, ...) clamp is
+    //     belt-and-braces only.
+    for (new_code[0..@as(usize, @intCast(new_len))]) |*ins| {
+        switch (ins.op) {
+            .jmp, .jmpf => ins.jmp_target = @max(0, ins.jmp_target - nargs),
+            else => {},
+        }
+    }
     g.rootPushPtr(@ptrCast(&new_code)); // pin the fresh array across #2/#3
     defer g.rootPop(); // new_code
 

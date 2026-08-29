@@ -91,6 +91,14 @@ pub const prim_table = [_]PrimDef{
     .{ .name = "<", .arity = 2, .func = primLt },
     .{ .name = ">=", .arity = 2, .func = primGe },
     .{ .name = "<=", .arity = 2, .func = primLe },
+    // ---- bitwise (elm/core Array support): JS int32 semantics ----
+    .{ .name = "bitwise-and", .arity = 2, .func = primBitwiseAnd },
+    .{ .name = "bitwise-or", .arity = 2, .func = primBitwiseOr },
+    .{ .name = "bitwise-xor", .arity = 2, .func = primBitwiseXor },
+    .{ .name = "bitwise-not", .arity = 1, .func = primBitwiseNot },
+    .{ .name = "bitwise-shift-left", .arity = 2, .func = primShiftLeft },
+    .{ .name = "bitwise-shift-right", .arity = 2, .func = primShiftRight },
+    .{ .name = "bitwise-shift-right-zf", .arity = 2, .func = primShiftRightZf },
     // ---- predicates ----
     .{ .name = "number?", .arity = 1, .func = primNumberP },
     .{ .name = "string?", .arity = 1, .func = primStringP },
@@ -1331,6 +1339,84 @@ fn primGe(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     } else {
         acc.* = values.valBoolean(false);
     }
+}
+
+// =====================================================================
+//  Bitwise: JS int32 semantics (elm/core Bitwise, needed by the Array port).
+//  ToInt32 truncates toward zero, the shift count is masked to 5 bits
+//  (count & 31), and zero-fill right shift yields unsigned 0..2^32-1.
+// =====================================================================
+
+/// JS ToInt32 truncates toward zero; 0-for-nonnumeric mirrors the primLt
+/// tolerance (Bitwise on a non-number can't be typed in Elm, so this is
+/// VM-level tolerance only).
+fn bitOperand(v: Value) i32 {
+    return switch (v.tag) {
+        .float => @intFromFloat(v.payload.float),
+        .number => @truncate(v.payload.number),
+        else => 0,
+    };
+}
+
+/// JS masks the shift count mod 32 (two's-complement bits: -1 & 31 == 31).
+fn shiftAmount(v: Value) u5 {
+    return @intCast(@as(u64, @bitCast(v.payload.number)) & 31);
+}
+
+fn primBitwiseAnd(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
+    const a1 = interp.vaPop(stack);
+    const a2 = interp.vaPop(stack);
+    // Ops stay in i32 range, so the i64 result is exact.
+    acc.* = values.valNumber(@as(i64, bitOperand(a1) & bitOperand(a2)));
+}
+
+fn primBitwiseOr(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
+    const a1 = interp.vaPop(stack);
+    const a2 = interp.vaPop(stack);
+    acc.* = values.valNumber(@as(i64, bitOperand(a1) | bitOperand(a2)));
+}
+
+fn primBitwiseXor(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
+    const a1 = interp.vaPop(stack);
+    const a2 = interp.vaPop(stack);
+    acc.* = values.valNumber(@as(i64, bitOperand(a1) ^ bitOperand(a2)));
+}
+
+fn primBitwiseNot(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
+    const a = interp.vaPop(stack);
+    acc.* = values.valNumber(@as(i64, ~bitOperand(a)));
+}
+
+/// ZINC RTL: a1 = leftmost = count, a2 = value (Bitwise.shiftLeftBy count
+/// value).  u32 << u5 discards the high bits (plain Zig <<), matching JS.
+fn primShiftLeft(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
+    const a1 = interp.vaPop(stack);
+    const a2 = interp.vaPop(stack);
+    const r: u32 = @as(u32, @bitCast(bitOperand(a2))) << shiftAmount(a1);
+    acc.* = values.valNumber(@as(i64, @as(i32, @bitCast(r))));
+}
+
+/// Arithmetic right shift (sign-extending).
+fn primShiftRight(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
+    const a1 = interp.vaPop(stack);
+    const a2 = interp.vaPop(stack);
+    acc.* = values.valNumber(@as(i64, bitOperand(a2) >> shiftAmount(a1)));
+}
+
+/// Zero-fill right shift: >>> yields unsigned 0..2^32-1 (Elm's
+/// shiftRightZfBy 1 -32 == 2147483632).
+fn primShiftRightZf(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    _ = vm;
+    const a1 = interp.vaPop(stack);
+    const a2 = interp.vaPop(stack);
+    const r: u32 = @as(u32, @bitCast(bitOperand(a2))) >> shiftAmount(a1);
+    acc.* = values.valNumber(@as(i64, r));
 }
 
 // =====================================================================
