@@ -92,6 +92,25 @@ pub fn defunLookup(table: [*]types.TableEntry, cap: usize, name: []const u8) ?ty
     return null;
 }
 
+/// P1 .global slot cache: defunLookup + the SLOT INDEX.  Slots are STABLE —
+/// open addressing, no rehash, no deletion; defunSet only inserts into an
+/// empty slot or overwrites in place, so a name's slot index is fixed for the
+/// life of the table.  The interp caches (idx+1) in Instr.jmp_target and
+/// validates by strcmp against the operand symbol before trusting the cached
+/// slot (belt-and-braces against any stale/garbage cache).
+pub fn defunLookupSlot(table: [*]types.TableEntry, cap: usize, name: []const u8) ?struct { idx: usize, value: types.Value } {
+    const n = std.mem.sliceTo(name, 0);
+    const h = hashName(n, cap);
+    var i: usize = 0;
+    while (i < cap) : (i += 1) {
+        const idx = (h + i) % cap;
+        const e = &table[idx];
+        if (e.name == null) return null; // open addressing: end of probe run
+        if (std.mem.eql(u8, std.mem.sliceTo(e.name.?, 0), n)) return .{ .idx = idx, .value = e.value };
+    }
+    return null;
+}
+
 /// C: zincvm.c:624-642 defun_has — probe whether the defun table has an
 /// explicit entry (NO val_prim/val_symbol fallback).  Used by bundle-load
 /// keyword registration (M6) to avoid clobbering bundled closures.

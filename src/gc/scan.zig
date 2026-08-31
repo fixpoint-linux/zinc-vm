@@ -35,8 +35,26 @@ pub fn evacuate(gc: *Gc, slot: *usize) void {
 pub fn scanValue(gc: *Gc, v: *types.Value) void {
     switch (v.tag) {
         .cons => {
+            // P1 DUAL-SHAPE: a fused pair (values.valCons) puts car/cdr in ONE
+            // 2-element value_array with cdr == car + sizeof(Value); a classic
+            // cons is two separate .value cells (48-byte stride: 8-byte header
+            // + 40-byte body), so a classic BODY pointer can never equal
+            // car+40 — that offset is always a header/filler word.  Read both
+            // fields BEFORE evacuating car (evacuation moves the whole array
+            // and forwards it).  For a fused pair, gcMove(car) moves the WHOLE
+            // array (car is the array body HEAD) and cdr is recomputed as the
+            // new interior — NEVER gcMove cdr separately: cdr-1 is element-0
+            // payload (garbage header).  Classic: evacuate each cell normally.
+            const car_addr: usize = @as(*const usize, @ptrCast(&v.payload.cons.car)).*;
+            const cdr_addr: usize = @as(*const usize, @ptrCast(&v.payload.cons.cdr)).*;
+            const fused = car_addr != 0 and cdr_addr == car_addr + @sizeOf(types.Value);
             evacuate(gc, @ptrCast(&v.payload.cons.car));
-            evacuate(gc, @ptrCast(&v.payload.cons.cdr));
+            if (fused) {
+                @as(*usize, @ptrCast(&v.payload.cons.cdr)).* =
+                    @as(*const usize, @ptrCast(&v.payload.cons.car)).* + @sizeOf(types.Value);
+            } else {
+                evacuate(gc, @ptrCast(&v.payload.cons.cdr));
+            }
         },
         .lambda => {
             evacuate(gc, @ptrCast(&v.payload.lambda.code));

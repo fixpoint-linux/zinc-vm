@@ -13,9 +13,13 @@
 //!     valStringFrom (slot-rooting) or supply a non-GC buffer.
 //!   - valStringFrom (C:169-181) pins src_slot via a ROOT_VALUE so its
 //!     str.data survives the allocRaw, then copies from the rooted slot.
-//!   - valCons ports C:274-294 verbatim (rootPushValue car, rootPushValue cdr,
-//!     alloc car cell, ROOT_PTR the car cell slot across the second alloc,
-//!     alloc cdr cell, store, 3 pops).
+//!   - valCons ports C:274-294 (rootPushValue car, rootPushValue cdr, two
+//!     cell allocs) but as a P1 FUSED PAIR: ONE 2-element .value_array (2 root
+//!     ops), with car = &pair[0], cdr = &pair[1] — interior pointers into the
+//!     same array.  The scan-time discriminator cdr == car + sizeof(Value)
+//!     (scan.zig scanValue DUAL-SHAPE) is sound: classic cells are separate
+//!     48-byte-stride objects, so a classic body pointer can never equal
+//!     car+40 (that offset is always a header/filler word).
 //!   - valLambda roots &code and &env ptr slots across allocArray, copies,
 //!     and sets code AFTER the env alloc (C:299-321 — v is unrooted, a pre-GC
 //!     assignment would go stale).
@@ -108,7 +112,14 @@ pub fn valStringFromErr(g: *Gc, src_slot: *Value) Value {
     return .{ .tag = .string, .payload = .{ .str = .{ .data = @ptrCast(dst), .len = @intCast(len) } } };
 }
 
-/// C: zincvm.c:274-294 val_cons — ported verbatim (see module doc).
+/// C: zincvm.c:274-294 val_cons — FUSED PAIR (P1): ONE 2-element .value_array
+/// instead of two .value cells (2 root ops instead of 4).  car = &pair[0],
+/// cdr = &pair[1] — interior pointers into the SAME array, so the scan-time
+/// discriminator is cdr == car + sizeof(Value) (see module doc + scan.zig).
+/// The 88-byte body is always nursery-eligible, so no construction write
+/// barrier is needed (same as the classic two-cell form).  carv/cdrv are
+/// rooted as Value slots across the single alloc; pair[0..2] are then filled
+/// from the rooted copies.
 pub fn valCons(g: *Gc, car: Value, cdr: Value) Value {
     var carv = car;
     var cdrv = cdr;
@@ -117,16 +128,11 @@ pub fn valCons(g: *Gc, car: Value, cdr: Value) Value {
     var g2 = g.rootValue(&cdrv);
     defer g2.end();
 
-    const car_cell = g.alloc(Value);
-    var car_root: *Value = car_cell;
-    g.rootPushPtr(@ptrCast(&car_root));
-    defer g.rootPop(); // car_root
+    const pair = g.allocArray(Value, 2); // .value_array — NO new GcTypeTag
+    pair[0] = carv;
+    pair[1] = cdrv;
 
-    const cdr_cell = g.alloc(Value);
-    car_root.* = carv;
-    cdr_cell.* = cdrv;
-
-    return .{ .tag = .cons, .payload = .{ .cons = .{ .car = car_root, .cdr = cdr_cell } } };
+    return .{ .tag = .cons, .payload = .{ .cons = .{ .car = &pair[0], .cdr = &pair[1] } } };
 }
 
 /// C: zincvm.c:299-321 val_lambda — roots &code and &env across the

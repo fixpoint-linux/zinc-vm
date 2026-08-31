@@ -351,14 +351,18 @@ test "M0 Vm skeleton roots err_slot once" {
     v.init(&g);
     defer v.deinit();
 
-    // err_slot (1) + the M10 frame-pool slot roots (FRAME_POOL_MAX).
-    try std.testing.expectEqual(wm + 1 + state.FRAME_POOL_MAX, g.rootWatermark());
+    // err_slot (1) + the M10 frame-pool slot roots (FRAME_POOL_MAX) + the M12
+    // stack-pool slot roots (STACK_POOL_MAX).
+    try std.testing.expectEqual(wm + 1 + state.FRAME_POOL_MAX + state.STACK_POOL_MAX, g.rootWatermark());
     try std.testing.expectEqual(@as(*heap.Gc, &g), v.gc);
     try std.testing.expectEqual(types.ValTag.nil, v.err_slot.tag);
-    // The pool starts empty with no instrumentation yet.
+    // The pools start empty with no instrumentation yet.
     try std.testing.expectEqual(@as(usize, 0), v.frame_pool_live);
     try std.testing.expectEqual(@as(u64, 0), v.frame_pool_hits);
     try std.testing.expectEqual(@as(u64, 0), v.frame_pool_misses);
+    try std.testing.expectEqual(@as(usize, 0), v.stack_pool_live);
+    try std.testing.expectEqual(@as(u64, 0), v.stack_pool_hits);
+    try std.testing.expectEqual(@as(u64, 0), v.stack_pool_misses);
 }
 
 // =====================================================================
@@ -1205,7 +1209,7 @@ test "M4 deep 2000-level cur/apply chain churns collections (verbose probe)" {
     defer v.deinit();
 
     const depth = 2000;
-    const wm0 = g.rootWatermark(); // err_slot root only
+    const wm0 = g.rootWatermark(); // the persistent init roots only (err_slot + pools)
 
     // Programmatic apply chain (no parser recursion):
     //   top        = [pushmark, number 42, cur(body_0), apply]

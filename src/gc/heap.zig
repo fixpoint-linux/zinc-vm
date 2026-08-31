@@ -628,8 +628,13 @@ pub const Gc = struct {
         // C: gc.c:1762 — write the header.
         self.freep[0] = types.makeHeader(words, type_tag);
 
-        // C: gc.c:1765 — zero the entire body.
-        @memset(self.freep[1..words], 0);
+        // C: gc.c:1765 — zero the entire body.  P1: skip for RAW bodies —
+        // every allocRaw/allocAtomic caller fully overwrites its body+NUL
+        // before the bytes are ever read, and RAW is never scanned
+        // (drainScanObject case 0 / verifyObject case 0).  Only the
+        // <=7B word-padding tail stays dirty, which nothing reads.
+        if (type_tag != .raw)
+            @memset(self.freep[1..words], 0);
 
         const object = self.freep + 1;
 
@@ -709,9 +714,11 @@ pub const Gc = struct {
                     const header: *usize = @ptrFromInt(self.nursery_cur);
                     header.* = types.makeHeader(words, type_tag);
 
-                    // C: gc.c:2217 — zero the body.
+                    // C: gc.c:2217 — zero the body.  P1: skip for RAW bodies
+                    // (same rationale as the old-gen path above).
                     const body: [*]usize = @ptrFromInt(self.nursery_cur + WORDBYTES);
-                    @memset(body[0 .. words - 1], 0);
+                    if (type_tag != .raw)
+                        @memset(body[0 .. words - 1], 0);
 
                     self.nursery_cur += total;
 

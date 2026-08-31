@@ -35,6 +35,7 @@ const types = gc.types;
 const values = @import("values.zig");
 const symbols = @import("symbols.zig");
 const state = @import("state.zig");
+const prims = @import("prims.zig");
 
 const Gc = gc.Gc;
 const Instr = types.Instr;
@@ -416,6 +417,22 @@ pub fn resolveJumps(code: [*]Instr, len: i32) void {
                     in.jmp_target = 0;
                 }
             },
+            // P1 fast dispatch: resolve the prim name to its comptime-stable
+            // prim_table index + 1 at parse time (0 = by-name fallback, keeps
+            // the unknownPrim hard-stop byte-identical).  The operand is a
+            // symbol (interned C-heap, stable); a non-symbol operand routes
+            // through the fallback exactly like the runtime empty-name path.
+            .prim => {
+                if (in.operand.tag == .symbol)
+                    in.jmp_target = if (prims.primIndex(values.symSlice(in.operand))) |pidx| @intCast(pidx + 1) else 0
+                else
+                    in.jmp_target = 0;
+            },
+            // P1 .global slot cache: jmp_target holds a cached defun slot
+            // (idx+1) written at RUNTIME by interp.  Belt-and-braces zero here
+            // (already zero from the parse-time std.mem.zeroes) so a fresh
+            // code array always starts uncached.
+            .global => in.jmp_target = 0,
             .cur => resolveJumps(@ptrCast(in.closure_code.?), in.closure_len),
             else => {},
         }

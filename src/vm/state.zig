@@ -49,6 +49,23 @@ pub const VmError = error{ ShenError, Halt };
 /// reserve-constrained heaps.  2 x 3 MB = 6 MB stays under the threshold.
 pub const FRAME_POOL_MAX: usize = 2;
 
+/// M12 value-stack pool: max idle VALUE_ARRAYs (value stacks) held for reuse
+/// across vmExecEnv entries (see interp.zig stackPoolAcquire/Release).  Unlike
+/// the frame pool, idle arrays are ALL-NIL at rest (release clears [0..len)),
+/// so the full-capacity drain scan pins NOTHING and retention is impossible —
+/// 16 is safe (the 3 MB-per-array math behind FRAME_POOL_MAX=2 does not
+/// apply: a cap-12 stack is ~1 page).  Pooled arrays are rooted persistently
+/// at init, so an idle array survives every collect below the vmExecEnv entry
+/// watermark.
+pub const STACK_POOL_MAX: usize = 16;
+
+/// One idle value-stack pool slot: the array base + its TRUE physical capacity
+/// (restored on acquire so vaPush's grow math reads the real cap).
+pub const StackPoolSlot = struct {
+    data: ?[*]types.Value = null,
+    cap: i32 = 0,
+};
+
 /// C: zincvm.h CatchFrame — DECISION A shape.  Stack-allocated at each
 /// catch site (trap-error in M5, the host harness): push by setting
 /// `.parent = vm.catch_chain; vm.catch_chain = &site;` and restore the
@@ -113,6 +130,18 @@ pub const Vm = struct {
     /// Instrumentation (instr_exec precedent): pool hits/misses across runs.
     frame_pool_hits: u64 = 0,
     frame_pool_misses: u64 = 0,
+    /// M12 value-stack pool: a LIFO free-list of up to STACK_POOL_MAX idle
+    /// VALUE_ARRAYs (value stacks), reused across vmExecEnv entries and apply
+    /// frame pushes instead of bump-allocating a fresh array per frame.  Each
+    /// slot's `data` is a PERSISTENT ROOT_PTR pushed at init (err_slot
+    /// precedent); idle arrays are all-nil so the full-capacity drain scan
+    /// pins nothing.
+    stack_pool: [STACK_POOL_MAX]StackPoolSlot = [_]StackPoolSlot{.{ .data = null, .cap = 0 }} ** STACK_POOL_MAX,
+    /// Number of non-empty entries in stack_pool[0..stack_pool_live).
+    stack_pool_live: usize = 0,
+    /// Instrumentation: pool hits/misses across runs.
+    stack_pool_hits: u64 = 0,
+    stack_pool_misses: u64 = 0,
     /// M11 tail-env reuse (interp.zig appterm N==A): hits = a tail call
     /// reused the current env array (the dead caller env fits the new
     /// arity); misses = a tail call had to allocate a fresh exact-size env
@@ -158,10 +187,12 @@ pub const Vm = struct {
 
         g.rootPushValue(&vm.err_slot);
 
-        // M10: persistent pool-slot roots (err_slot precedent), pushed at
+        // M10/M12: persistent pool-slot roots (err_slot precedent), pushed at
         // init and popped in reverse at deinit so idle pooled arrays stay
-        // pinned below every vmExecEnv entry watermark.
+        // pinned below every vmExecEnv entry watermark.  Stack-pool slots root
+        // the `data` field (the GC-managed array base).
         for (0..FRAME_POOL_MAX) |i| g.rootPushPtr(@ptrCast(&vm.frame_pool[i]));
+        for (0..STACK_POOL_MAX) |i| g.rootPushPtr(@ptrCast(&vm.stack_pool[i].data));
 
         vm.initGlobals();
     }
@@ -172,8 +203,14 @@ pub const Vm = struct {
         a.free(vm.defun_table[0..@as(usize, @intCast(vm.defun_table_cap))]);
         a.free(vm.values_table[0..@as(usize, @intCast(vm.values_table_cap))]);
         // Pop the pool-slot roots in reverse (LIFO) BEFORE err_slot to keep
-        // the root stack balanced.
-        var i = FRAME_POOL_MAX;
+        // the root stack balanced.  Stack-pool slots were pushed last, so they
+        // pop first.
+        var i = STACK_POOL_MAX;
+        while (i > 0) {
+            i -= 1;
+            vm.gc.rootPop(); // stack_pool[i].data
+        }
+        i = FRAME_POOL_MAX;
         while (i > 0) {
             i -= 1;
             vm.gc.rootPop(); // frame_pool[i]

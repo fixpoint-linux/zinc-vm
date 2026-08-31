@@ -71,6 +71,7 @@ const types = gc.types;
 const state = @import("state.zig");
 const values = @import("values.zig");
 const prims = @import("prims.zig");
+const tables = @import("tables.zig");
 
 const Gc = gc.Gc;
 const Value = types.Value;
@@ -283,7 +284,7 @@ pub fn zincArity(code: ?*types.Instr, code_len: i32) i32 {
 /// false when the frame stack is exhausted — the caller breaks :run and
 /// vmExecEnv's epilogue returns acc.
 fn popFramePushAcc(
-    g: *Gc,
+    vm: *Vm,
     accv: Value,
     frame_stack: [*]types.CallFrame,
     frames_sp: *i32,
@@ -295,6 +296,7 @@ fn popFramePushAcc(
     env_cap: *i32,
     stack: *types.ValueArray,
 ) bool {
+    const g = vm.gc;
     if (frames_sp.* <= 0) return false;
     frames_sp.* -= 1;
     const cf = &frame_stack[@intCast(frames_sp.*)];
@@ -304,7 +306,7 @@ fn popFramePushAcc(
     env.* = cf.env;
     env_len.* = cf.env_len;
     env_cap.* = cf.env_cap;
-    vaFree(stack);
+    stackPoolRelease(vm, stack);
     stack.* = cf.stack;
     cf.env = null;
     cf.stack.data = null;
@@ -553,6 +555,50 @@ fn frameStackRelease(vm: *Vm, arr: [*]types.CallFrame, sp: i32) void {
     }
 }
 
+/// M12 value-stack pool: acquire a value stack for one vmExecEnv frame (the
+/// prologue) or an apply frame push.  A hit reuses an idle pooled array (all
+/// -nil at rest by the release invariant, so no @memset needed); a miss
+/// allocates fresh via vaInit.  No allocation on the hit path — the array
+/// moves pool-slot -> local with no collect possible mid-transfer (the pool
+/// slot is a persistent root, the local `a.data` slot is already rooted by the
+/// caller's prologue).
+fn stackPoolAcquire(vm: *Vm, a: *types.ValueArray) void {
+    if (vm.stack_pool_live > 0) {
+        vm.stack_pool_live -= 1;
+        const slot = &vm.stack_pool[vm.stack_pool_live];
+        a.data = slot.data;
+        a.cap = slot.cap;
+        a.len = 0;
+        slot.data = null;
+        slot.cap = 0;
+        vm.stack_pool_hits += 1;
+    } else {
+        vm.stack_pool_misses += 1;
+        vaInit(vm.gc, a);
+    }
+}
+
+/// M12 value-stack pool: release `a`'s array back to the pool on frame death.
+/// MUST contain no allocation — the only live references during the transfer
+/// are the (still-rooted) local slot on the way in and the persistent pool
+/// slot on the way out, so no collect can move the array mid-copy.  Clears
+/// [0..len) to nil (pitfall 5: a value_array is drain-scanned by FULL capacity,
+/// so a stale ref would retain a dead value; slots >= len are already nil by
+/// the vaPop/vaPush-grow invariant).  When the pool is full the array is
+/// dropped — its pages are never queued, so it needs no clearing (graceful
+/// degradation to per-call alloc).  Always vaFree's the ValueArray afterward.
+fn stackPoolRelease(vm: *Vm, a: *types.ValueArray) void {
+    if (a.data) |data| {
+        if (vm.stack_pool_live < state.STACK_POOL_MAX) {
+            if (a.len > 0)
+                @memset(data[0..@intCast(a.len)], values.valNil());
+            vm.stack_pool[vm.stack_pool_live] = .{ .data = data, .cap = a.cap };
+            vm.stack_pool_live += 1;
+        }
+    }
+    vaFree(a);
+}
+
 /// C: zincvm.c:3154-3466 vm_exec_env.  THE ROOTING CRUX — see the module
 /// doc for the full contract.  Every root push is annotated with its C line;
 /// the single defer rootPopTo(entry_wm) covers ALL exits (break-to-done,
@@ -587,7 +633,7 @@ pub fn vmExecEnv(
     g.rootPushPtr(@ptrCast(&env)); // (3) ROOT_PTR — stable slot for env — C:3167
     g.rootPushPtr(@ptrCast(&stack.data)); // (4) ROOT_PTR — stable slot for stack.data — C:3168
     g.rootPushValue(&acc); // (5) ROOT_VALUE — stable slot for acc — C:3169
-    vaInit(g, &stack); // now safe: all slots above are rooted — C:3171
+    stackPoolAcquire(vm, &stack); // now safe: all slots above are rooted — C:3171
 
     // ---- initial environment copy (C:3172-3181).  init_env is rooted (2),
     // so post-alloc reads of its elements are fresh.
@@ -661,7 +707,7 @@ pub fn vmExecEnv(
                 env = cf.env;
                 env_len = cf.env_len;
                 env_cap = cf.env_cap;
-                vaFree(&stack);
+                stackPoolRelease(vm, &stack);
                 stack = cf.stack;
                 // Release stale GC pointers in the popped slot so the full
                 // CALLFRAME_ARRAY drain scan does not keep dead frame envs /
@@ -693,13 +739,24 @@ pub fn vmExecEnv(
             // C:3233-3244 — [prim X]: args already on stack (auto-pushed by
             // loads); execute the primitive, push the result.
             .prim => {
-                const pn = if (in.operand.tag == .symbol) values.symSlice(in.operand) else "";
-                execPrimitive(vm, pn, &acc, &stack) catch |e| switch (e) {
-                    // C: exec_primitive() < 0 → goto done (acc preserved).
-                    error.Halt => break :run,
-                    // A prim-thrown Shen error unwinds to the catch site.
-                    error.ShenError => return error.ShenError,
-                };
+                // P1 fast dispatch: jmp_target holds the parse-resolved
+                // prim_table index + 1 (0 = by-name fallback, byte-identical
+                // unknownPrim hard-stop).  Skips the StaticStringMap hash per
+                // prim op — same handler, same error routing.
+                if (in.jmp_target > 0) {
+                    prims.primByIndex(@intCast(in.jmp_target - 1)).func(vm, &acc, &stack) catch |e| switch (e) {
+                        error.Halt => break :run,
+                        error.ShenError => return error.ShenError,
+                    };
+                } else {
+                    const pn = if (in.operand.tag == .symbol) values.symSlice(in.operand) else "";
+                    execPrimitive(vm, pn, &acc, &stack) catch |e| switch (e) {
+                        // C: exec_primitive() < 0 → goto done (acc preserved).
+                        error.Halt => break :run,
+                        // A prim-thrown Shen error unwinds to the catch site.
+                        error.ShenError => return error.ShenError,
+                    };
+                }
                 vaPush(g, &stack, acc);
                 pc += 1;
             },
@@ -725,7 +782,8 @@ pub fn vmExecEnv(
                         env_len = cf.env_len;
                         env_cap = cf.env_cap;
                         // C:3257 — no va_free here; the current stack array
-                        // is simply GC'd later.
+                        // is simply GC'd later (now pooled instead — M12).
+                        stackPoolRelease(vm, &stack);
                         stack = cf.stack;
                         cf.env = null;
                         cf.stack.data = null;
@@ -804,7 +862,7 @@ pub fn vmExecEnv(
                         cf.env_len = env_len;
                         cf.env_cap = env_cap;
                         cf.stack = stack;
-                        vaInit(g, &stack); // ALLOC — cf must not be touched after this
+                        stackPoolAcquire(vm, &stack); // may ALLOC (miss) — cf must not be touched after this
 
                         env = null;
                         env_len = 0;
@@ -889,7 +947,7 @@ pub fn vmExecEnv(
             // appterm's under-application paths below.)
             .ret => {
                 if (!popFramePushAcc(
-                    g,
+                    vm,
                     acc,
                     frame_stack,
                     &frames_sp,
@@ -915,10 +973,28 @@ pub fn vmExecEnv(
             },
 
             // C:3365-3378 — global lookup (defun table; the fallback
-            // val_symbol interns on the C heap only — no GC alloc).
+            // val_symbol interns on the C heap only — no GC alloc).  P1 slot
+            // cache: jmp_target holds a cached defun slot (idx+1), validated
+            // by strcmp against the operand symbol; a miss re-probes and
+            // re-caches.  No GC allocation anywhere in this path, so `in`
+            // (re-derived above) stays valid across the cached-slot write.
             .global => {
                 const nm = if (in.operand.tag == .symbol) values.symSlice(in.operand) else "";
+                if (in.jmp_target > 0) {
+                    const e = &vm.defun_table[@intCast(in.jmp_target - 1)];
+                    if (e.name != null and std.mem.eql(u8, std.mem.sliceTo(e.name.?, 0), nm)) {
+                        acc = e.value;
+                        vaPush(g, &stack, acc);
+                        pc += 1;
+                        continue :run;
+                    }
+                }
                 acc = try vm.defunGetChecked(nm);
+                if (nm.len > 0) {
+                    if (tables.defunLookupSlot(vm.defun_table, tables.DEFUN_TABLE_CAP, nm)) |sl| {
+                        in.jmp_target = @intCast(sl.idx + 1);
+                    }
+                }
                 vaPush(g, &stack, acc);
                 pc += 1;
             },
@@ -1089,7 +1165,7 @@ pub fn vmExecEnv(
                             acc = buildPartialClosure(g, &acc, &argbuf, nargs);
                         g.rootPop(); // argbuf
                         if (!popFramePushAcc(
-                            g,
+                            vm,
                             acc,
                             frame_stack,
                             &frames_sp,
@@ -1131,7 +1207,7 @@ pub fn vmExecEnv(
 
     // done: (C:3463-3468) — the 8 root pops are the defer rootPopTo above;
     // frame_stack is GC-allocated (no free needed); acc is returned.
-    vaFree(&stack);
+    stackPoolRelease(vm, &stack);
     return acc;
 }
 

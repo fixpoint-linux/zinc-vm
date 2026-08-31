@@ -194,6 +194,24 @@ pub fn lookupDef(name: []const u8) ?*const PrimDef {
     return null;
 }
 
+/// P1 fast dispatch: comptime-stable index of `name` in prim_table (the
+/// table is a fixed comptime array — its order never changes at runtime), or
+/// null when unknown.  parser.zig resolveJumps stores this +1 into
+/// Instr.jmp_target (0 = by-name fallback, byte-identical unknownPrim path).
+pub fn primIndex(name: []const u8) ?usize {
+    for (&prim_table, 0..) |*def, i| {
+        if (std.mem.eql(u8, std.mem.sliceTo(def.name, 0), name)) return i;
+    }
+    return null;
+}
+
+/// P1 fast dispatch: entry by table index (the caller stores index+1 in
+/// jmp_target and subtracts 1 back here).  Caller bounds: jmp_target > 0
+/// guarantees i < prim_table.len by construction (resolveJumps).
+pub fn primByIndex(i: usize) *const PrimDef {
+    return &prim_table[i];
+}
+
 /// C: zincvm.c:2790-2793 unknown tail — print + return -1.  Mapped to
 /// error.Halt: the eval-loop call sites catch it and break to done with acc
 /// preserved (the C `exec_primitive() < 0 -> goto done`).
