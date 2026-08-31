@@ -118,6 +118,7 @@ pub const prim_table = [_]PrimDef{
     .{ .name = "str", .arity = 1, .func = primStr },
     .{ .name = "string->n", .arity = 1, .func = primStringToN },
     .{ .name = "n->string", .arity = 1, .func = primNToString },
+    .{ .name = "repeat", .arity = 2, .func = primRepeat },
     .{ .name = "c-strlen", .arity = 1, .func = primCStrlen },
     .{ .name = "char-code", .arity = 2, .func = primCharCode },
     .{ .name = "substring", .arity = 3, .func = primSubstring },
@@ -403,6 +404,44 @@ fn primCn(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     cnWrite(buf[l1..][0..l2], a2, l2, &t2);
     buf[total] = 0;
     g.rootPop();
+    g.rootPop();
+    acc.* = .{ .tag = .string, .payload = .{ .str = .{
+        .data = buf,
+        .len = @intCast(total),
+    } } };
+}
+
+/// P2-9 native Str.repeat — repeat n s == s concatenated n times, ONE
+/// allocRaw(slen*n+1) instead of the Elm loop's n x String.append (n allocs,
+/// quadratic byte copy).  a1 = n (count, top — the wrapper pushes arg0 then
+/// arg1, so the top is the FIRST source arg; see the cn hand-bundle
+/// `m S"world" S"hello" g cn p` == "helloworld").  a2 (the string) is ROOTED
+/// across allocRaw (pitfall 6 — str.data is an interior GC pointer).  n<=0 or
+/// an empty string -> "" (byte-identical to the Elm loop).  Body filled by
+/// doubling memcpy (each byte copied O(log n) times).
+fn primRepeat(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    const g = vm.gc;
+    const a1 = interp.vaPop(stack); // count
+    var a2 = interp.vaPop(stack); // string
+    const n: i64 = a1.payload.number;
+    const slen: i64 = a2.payload.str.len;
+    if (n <= 0 or slen <= 0) {
+        acc.* = values.valString(g, "");
+        return;
+    }
+    const total = std.math.mul(usize, @intCast(slen), @intCast(n)) catch
+        return vm.throwShen("repeat: out of memory");
+    g.rootPushValue(&a2);
+    const buf = g.allocRaw(total + 1);
+    const src = values.strSlice(a2); // fresh read via the rooted slot
+    @memcpy(buf[0..@intCast(slen)], src);
+    var covered: usize = @intCast(slen);
+    while (covered < total) {
+        const chunk = @min(covered, total - covered);
+        @memcpy(buf[covered .. covered + chunk], buf[0..chunk]);
+        covered += chunk;
+    }
+    buf[total] = 0;
     g.rootPop();
     acc.* = .{ .tag = .string, .payload = .{ .str = .{
         .data = buf,

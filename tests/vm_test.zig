@@ -1660,6 +1660,30 @@ test "M5 zinctest 18-23: string prims cn/n->string/string->n/str/tlstr/intern" {
     try std.testing.expectEqualStrings("foo", values.symSlice(r));
 }
 
+test "M5 P2-9 repeat prim: n x s, n<=0/empty, doubling fill" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // RTL push: string (second arg) first, count (first arg) last (top), so
+    // a1 = n, a2 = s — the same order the compiler's `repeat.curried`
+    // wrapper [Access 0, Access 1, Prim repeat] produces.
+    try expectRunStr(&g, &v, "(mS[1:S]xn[1:n]3P[6:s]repeatv)", "xxx");
+    try expectRunStr(&g, &v, "(mS[5:S]hellon[1:n]1P[6:s]repeatv)", "hello");
+    try expectRunStr(&g, &v, "(mS[1:S]xn[1:n]0P[6:s]repeatv)", "");
+    try expectRunStr(&g, &v, "(mS[1:S]xn[2:n]-5P[6:s]repeatv)", "");
+    try expectRunStr(&g, &v, "(mS[0:S]n[1:n]2P[6:s]repeatv)", "");
+    // 40 rounds exercises the doubling fill path past several powers of two.
+    try expectRunStr(
+        &g,
+        &v,
+        "(mS[2:S]abn[2:n]40P[6:s]repeatv)",
+        "abababababababababababababababababababababababababababababababababababababababab",
+    );
+}
+
 test "M5 zinctest 26: simple-error throws ShenError with the message" {
     var g = try testInit();
     defer g.deinit();

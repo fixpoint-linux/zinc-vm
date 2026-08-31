@@ -465,6 +465,52 @@ test "M1 dirty vectors: dedup, cap + overflow valve, clear" {
     try std.testing.expectEqual(@as(u64, heap_mod.DIRTY_VECTORS_MAX + 1), g.dirty_vectors_fired);
 }
 
+test "P2-10 dirty vectors hash dedup: interleaved re-adds stay distinct" {
+    var g = try testInit();
+    defer g.deinit();
+
+    // K crosses the 64-entry linear-scan/hash handoff threshold so the index
+    // path is exercised; M rounds re-add the SAME arrays to force dedup.
+    const K = 300;
+    const M = 4;
+    var arrays: [K][*]types.Value = undefined;
+    for (&arrays) |*arr| arr.* = g.allocArray(types.Value, 2);
+
+    var round: usize = 0;
+    while (round < M) : (round += 1) {
+        var i: usize = 0;
+        while (i < K) : (i += 1) g.dirtyVectorsAdd(arrays[i]);
+    }
+    try std.testing.expectEqual(@as(usize, K), g.dirty_vectors_count);
+    try std.testing.expectEqual(@as(u64, K), g.dirty_vectors_fired);
+    try std.testing.expect(!g.dirty_vectors_overflow);
+
+    // Re-adding every member is a pure dedup (count/fired unchanged)...
+    for (arrays) |arr| g.dirtyVectorsAdd(arr);
+    try std.testing.expectEqual(@as(usize, K), g.dirty_vectors_count);
+    try std.testing.expectEqual(@as(u64, K), g.dirty_vectors_fired);
+
+    // ...and the array contents are exactly the K distinct bases (the set
+    // invariant == dirty_vectors[0..count]).
+    var seen = std.AutoHashMap(usize, void).init(std.testing.allocator);
+    defer seen.deinit();
+    for (g.dirty_vectors[0..g.dirty_vectors_count]) |dv| {
+        const key = @intFromPtr(dv);
+        try std.testing.expect(!seen.contains(key));
+        try seen.put(key, {});
+    }
+    try std.testing.expectEqual(@as(usize, K), seen.count());
+
+    // Clear bumps the epoch: stale slots must NOT falsely dedup the same
+    // pointers re-added in the next generation.
+    g.dirtyVectorsClear();
+    try std.testing.expectEqual(@as(usize, 0), g.dirty_vectors_count);
+    var j: usize = 0;
+    while (j < K) : (j += 1) g.dirtyVectorsAdd(arrays[j]);
+    try std.testing.expectEqual(@as(usize, K), g.dirty_vectors_count);
+    try std.testing.expectEqual(@as(u64, 2 * K), g.dirty_vectors_fired);
+}
+
 test "M1 dirty defuns bitset: mark/test/clear + counters" {
     var g = try testInit();
     defer g.deinit();

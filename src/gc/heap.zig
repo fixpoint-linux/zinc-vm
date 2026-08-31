@@ -64,6 +64,14 @@ pub const MIN_HEAP_BYTES = MIN_HEAP_PAGES * PAGEBYTES;
 /// C: gc.c:351 DIRTY_VECTORS_MAX — remembered-set capacity valve.
 pub const DIRTY_VECTORS_MAX = 8192;
 
+/// P2-10: the dirty-vectors dedup index capacity (open addressing wants
+/// headroom, so 2x the array cap) and the linear-scan/hash handoff
+/// threshold.  Below the threshold the linear scan is cache-friendlier (most
+/// frames keep <10 distinct arrays post-P1 pooling); at/above it the
+/// epoch-stamped open-addressing index makes dedup O(1).
+pub const DIRTY_VECTORS_HASH_CAPACITY = 2 * DIRTY_VECTORS_MAX;
+const DIRTY_VECTORS_HASH_THRESHOLD = 64;
+
 /// C: zincvm.h:38 DEFUN_TABLE_CAP — dirty-defuns bitset is exactly this many
 /// bits (4096 bits = 512 bytes = 64 x u64 words).
 pub const DEFUN_TABLE_CAP = 4096;
@@ -84,6 +92,30 @@ pub const Trigger = enum {
     reactive,
     alloc,
 };
+
+/// P2-10: one slot of the dirty-vectors dedup index.  `ptr` is the array
+/// BASE address (0 = empty, no GC object lives at 0); `epoch` is the
+/// generation stamp under which `ptr` was recorded — a clear bumps the
+/// current epoch, so every slot from the previous epoch reads as stale/empty
+/// and is overwritten lazily (O(1) clear, no rehash).
+pub const HashSlot = extern struct {
+    ptr: usize = 0,
+    epoch: u64 = 0,
+};
+
+/// P2-10: index hash for an array base pointer.  Arrays are 8-byte-aligned
+/// (page-aligned in practice), so the low 6 bits are constant noise — shift
+/// them out, then avalanche the remaining bits (a splitmix64 finalizer) so
+/// adjacent heap addresses spread uniformly across the table.
+fn dirtyVectorHash(ptr: usize) u64 {
+    var h: u64 = @intCast(ptr >> 6);
+    h ^= h >> 33;
+    h *%= 0xff51afd7ed558ccd;
+    h ^= h >> 33;
+    h *%= 0xc4ceb9fe1a85ec53;
+    h ^= h >> 33;
+    return h;
+}
 
 /// C: gc_init(uintptr_t heap_size) + the gc_set_verbose flag.  heap_bytes
 /// must be a multiple of PAGEBYTES (gc.h:32-34) and >= MIN_HEAP_BYTES;
@@ -202,6 +234,14 @@ pub const Gc = struct {
     dirty_vectors_count: usize = 0,
     dirty_vectors_cap: usize = 0,
     dirty_vectors_overflow: bool = false,
+
+    // ---- P2-10 dedup index (NEVER read by the collector: the ARRAY above
+    // is the remembered-set invariant; this is a pure membership index kept
+    // in lockstep with it).  Lazily allocated+filled on the first insert
+    // that grows count past DIRTY_VECTORS_HASH_THRESHOLD; epoch stamping
+    // makes dirtyVectorsClear an O(1) bump instead of a rehash.
+    dirty_vectors_hash: ?[]HashSlot = null,
+    dirty_vectors_epoch: u64 = 1,
 
     // ---- write-barrier remembered set: dirty defuns bitset — C: gc.c:400 ----
     dirty_defuns: [DEFUN_TABLE_CAP / 64]u64 = [_]u64{0} ** (DEFUN_TABLE_CAP / 64),
@@ -366,6 +406,8 @@ pub const Gc = struct {
         pa.free(self.page_queued);
         if (self.dirty_vectors.len > 0)
             pa.free(self.dirty_vectors);
+        if (self.dirty_vectors_hash) |hs|
+            pa.free(hs);
         // Shadow stack (page_allocator memory, grown on demand — roots.zig
         // shadowStackGrow; cap==0 means it was never allocated).
         if (self.shadow_cap != 0)
@@ -910,12 +952,25 @@ pub const Gc = struct {
     /// capacity-capped at DIRTY_VECTORS_MAX with an overflow valve (on
     /// overflow the nursery scavenge falls back to a full old-gen
     /// OBJECT-page queue — M4).
+    ///
+    /// P2-10: dedup uses an epoch-stamped open-addressing index once the
+    /// distinct-array count passes DIRTY_VECTORS_HASH_THRESHOLD (the O(n)
+    /// linear scan stays below it, where it is cache-friendlier).  The ARRAY
+    /// is unchanged — its contents, order, growth and overflow valve are
+    /// byte-identical to the C original and remain the remembered-set
+    /// invariant collect.zig reads; the hash is a pure membership index kept
+    /// in lockstep with it (set contents == dirty_vectors[0..count] at all
+    /// times).
     pub fn dirtyVectorsAdd(self: *Gc, data: [*]types.Value) void {
         if (self.dirty_vectors_overflow) return; // C: gc.c:358
 
-        var i: usize = 0; // C: gc.c:359-360 — dedup scan.
-        while (i < self.dirty_vectors_count) : (i += 1) {
-            if (self.dirty_vectors[i] == data) return;
+        if (self.dirty_vectors_hash) |hs| {
+            if (self.dirtyVectorHashProbe(hs, @intFromPtr(data))) return;
+        } else {
+            var i: usize = 0; // C: gc.c:359-360 — dedup scan.
+            while (i < self.dirty_vectors_count) : (i += 1) {
+                if (self.dirty_vectors[i] == data) return;
+            }
         }
 
         // C: gc.c:361-364 — overflow valve.
@@ -939,13 +994,81 @@ pub const Gc = struct {
         self.dirty_vectors[self.dirty_vectors_count] = data;
         self.dirty_vectors_count += 1;
         self.dirty_vectors_fired += 1; // C: gc.c:373
+
+        // P2-10: keep the index in lockstep with the array.  The lazy
+        // allocation fires on the first insert that grows count PAST the
+        // threshold and populates the index from the whole array (so the
+        // first THRESHOLD entries are present too, not just the new one).
+        // On alloc failure the hash stays null and the linear scan keeps
+        // serving — still correct, just O(n).
+        if (self.dirty_vectors_hash) |hs| {
+            self.dirtyVectorHashPut(hs, @intFromPtr(data));
+        } else if (self.dirty_vectors_count > DIRTY_VECTORS_HASH_THRESHOLD) {
+            _ = self.dirtyVectorHashAllocFill();
+        }
     }
 
     /// C: gc.c:376-379 gc_dirty_vectors_clear — end of each nursery scavenge
-    /// and on full-collect semi-space flip.
+    /// and on full-collect semi-space flip.  P2-10: the epoch bump is the
+    /// O(1) index clear — every previous-epoch slot reads stale and is
+    /// overwritten lazily, no rehash.
     pub fn dirtyVectorsClear(self: *Gc) void {
         self.dirty_vectors_count = 0;
         self.dirty_vectors_overflow = false;
+        self.dirty_vectors_epoch += 1;
+    }
+
+    /// P2-10: true iff `ptr` is present under the current epoch.  A slot
+    /// whose epoch does not match is stale/empty — it ends the probe cluster
+    /// (open addressing inserts only into the current epoch, so a live run
+    /// of current-epoch slots is never split by a stale one).
+    fn dirtyVectorHashProbe(self: *const Gc, hs: []const HashSlot, ptr: usize) bool {
+        const cap = hs.len;
+        var idx: usize = @intCast(dirtyVectorHash(ptr) % cap);
+        var n: usize = 0;
+        while (n < cap) : (n += 1) {
+            const slot = hs[idx];
+            if (slot.epoch != self.dirty_vectors_epoch) return false;
+            if (slot.ptr == ptr) return true;
+            idx += 1;
+            if (idx == cap) idx = 0;
+        }
+        return false; // unreachable: cap is 2x DIRTY_VECTORS_MAX, count <= cap/2
+    }
+
+    /// P2-10: record `ptr` under the current epoch (caller has already proven
+    /// absence via dirtyVectorHashProbe).  The table can never fill — at most
+    /// DIRTY_VECTORS_MAX entries are ever inserted into twice that capacity.
+    fn dirtyVectorHashPut(self: *const Gc, hs: []HashSlot, ptr: usize) void {
+        const cap = hs.len;
+        var idx: usize = @intCast(dirtyVectorHash(ptr) % cap);
+        while (true) {
+            const slot = hs[idx];
+            if (slot.epoch != self.dirty_vectors_epoch or slot.ptr == 0) {
+                hs[idx].ptr = ptr;
+                hs[idx].epoch = self.dirty_vectors_epoch;
+                return;
+            }
+            if (slot.ptr == ptr) return; // already present (shouldn't happen)
+            idx += 1;
+            if (idx == cap) idx = 0;
+        }
+    }
+
+    /// P2-10: allocate the 16384-slot index and populate it from the current
+    /// array contents [0..count] (which already includes the just-appended
+    /// entry at the transition).  Returns false on alloc failure; the caller
+    /// then keeps using the linear scan.
+    fn dirtyVectorHashAllocFill(self: *Gc) bool {
+        if (self.dirty_vectors_hash != null) return true;
+        const hs = std.heap.page_allocator.alloc(HashSlot, DIRTY_VECTORS_HASH_CAPACITY) catch
+            return false;
+        @memset(hs, std.mem.zeroes(HashSlot));
+        for (self.dirty_vectors[0..self.dirty_vectors_count]) |dv| {
+            self.dirtyVectorHashPut(hs, @intFromPtr(dv));
+        }
+        self.dirty_vectors_hash = hs;
+        return true;
     }
 
     /// C: gc.c:404-412 gc_dirty_defuns_mark — bit i of the fixed bitset;
