@@ -82,7 +82,7 @@ const VmError = state.VmError;
 // =====================================================================
 
 /// C: zincvm.c:407 STACK_INIT_CAP.
-pub const STACK_INIT_CAP: i32 = 64;
+pub const STACK_INIT_CAP: i32 = 12;
 
 /// C: zincvm.c:410-413 va_init.  Must only be called once the caller's
 /// stable slots for a->data (and anything read during the alloc) are rooted

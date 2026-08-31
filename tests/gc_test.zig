@@ -1068,15 +1068,18 @@ test "M4 T7 trigger counters: burst allocation fires PREEMPTIVE, never REACTIVE"
     var g = try testInit();
     defer g.deinit();
 
-    // 45,000 dead Values x 48 B (40 B body + header) = 2.16 MB of nursery
-    // traffic: crosses the 2 MB - 256 KB pre-emptive low-water line
-    // (NURSERY_SCAVENGE_FREE_LOWATER, gc.c:2177-2185) mid-burst, then — after
-    // the rewind — leaves ~1.8 MB free, far above the line, so only the
-    // PREEMPTIVE path fires.  (30k x 48 B = 1.44 MB never reaches the line;
-    // the plan's figure assumed C's per-object overhead — the invariant, not
-    // the literal count, is what is asserted.)
+    // A burst of dead Values (48 B each = 40 B body + 8 B header word) that
+    // crosses the pre-emptive low-water line mid-burst: PREEMPTIVE fires when
+    // free nursery space drops to NURSERY_SCAVENGE_FREE_LOWATER (gc.c
+    // :2177-2185), then the rewind restores the full region, so the remainder
+    // never reaches REACTIVE.  The count derives from NURSERY_BYTES so the
+    // test tracks a nursery retune (P0c: 2 MB -> 8 MB) instead of assuming the
+    // C default — the invariant, not the literal count, is what is asserted.
+    const bytes_per_value = 48;
+    const count = (heap_mod.NURSERY_BYTES - heap_mod.NURSERY_SCAVENGE_FREE_LOWATER) /
+        bytes_per_value + 1;
     var i: usize = 0;
-    while (i < 45_000) : (i += 1) {
+    while (i < count) : (i += 1) {
         const v = g.alloc(types.Value);
         v.* = .{ .tag = .number, .payload = .{ .number = @intCast(i) } };
     }

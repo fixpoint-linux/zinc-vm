@@ -44,8 +44,13 @@ pub const CONTINUED: usize = 1;
 /// C: gc.c:47 NURSERY — space[] tag for nursery pages (never 0/1/2, so
 /// allocatepage's free-page scan skips them, gc.c:1893-1895).
 pub const NURSERY: usize = 3;
-/// C: gc.c:48 NURSERY_BYTES — fixed 2 MB nursery at the start of the heap.
-pub const NURSERY_BYTES = 2 * 1024 * 1024;
+/// C: gc.c:48 NURSERY_BYTES — fixed nursery at the start of the heap.  The C
+/// 2 MB default makes ~3 KB of old-gen per-call churn (STACK_INIT_CAP=64) force
+/// a nursery scavenge every few hundred calls; 8 MB amortises scavenges ~8x
+/// (P0c).  The host heap must stay >= ~4x the nursery (old-gen semi-space
+/// must fit the M10 frame pool + live set), so heaps below ~32 MB are too
+/// tight for 8 MB.
+pub const NURSERY_BYTES = 8 * 1024 * 1024;
 /// C: gc.c:49 NURSERY_PAGES.
 pub const NURSERY_PAGES = NURSERY_BYTES / PAGEBYTES;
 /// C: gc.c:54 NURSERY_SCAVENGE_FREE_LOWATER — fire a pre-emptive nursery

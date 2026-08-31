@@ -191,7 +191,12 @@ fn parseBody(ps: *ParseState, g: *Gc, sym: *SymbolInterner, out: *?[*]Instr) Par
                 advance(ps);
                 // Stable one-word slot for the child closure_code, pushed on
                 // the shadow stack for the whole parse_body (C:2882-2896).
+                // NULL-initialise BEFORE the root push: a collect during the
+                // nested parse_body reads this slot (scanRoots ROOT_PTR), and
+                // a.create leaves it uninitialised (0xaa fill in Debug = the
+                // misaligned-root panic under a GC storm).
                 const slot = a.create(?[*]Instr) catch unreachable;
+                slot.* = null;
                 cc.append(a, slot) catch unreachable;
                 ps.cc_slots = cc.items;
                 ps.cc_len = cc.items.len;
