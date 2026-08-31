@@ -127,6 +127,19 @@ pub fn parseCsexpAtom(ps: *ParseState, g: *Gc, sym: *SymbolInterner) ParseError!
     return v;
 }
 
+/// P3 fused-op prim resolution: `v` must be a symbol naming a prim_table
+/// entry; returns index+1 for Instr.jmp_target (0 is reserved for the by-name
+/// fallback in the plain .prim op).  Unknown or non-symbol prims are a hard
+/// ParseError — the Elm compiler only emits fused ops for prims in its own
+/// tables (a strict subset of prim_table), so a mismatch is a compiler/VM
+/// drift bug, surfaced at parse time rather than as a silent runtime fallback.
+fn resolvePrimTarget(v: Value) ParseError!i32 {
+    if (v.tag == .symbol) {
+        if (prims.primIndex(values.symSlice(v))) |pidx| return @intCast(pidx + 1);
+    }
+    return error.ParseError;
+}
+
 /// C: zincvm.c:2846-2974 parse_body.  See module doc for the cc_slots rooting
 /// protocol.  Returns the code length and writes the GC-managed Instr array
 /// head into `out`.
@@ -185,6 +198,30 @@ fn parseBody(ps: *ParseState, g: *Gc, sym: *SymbolInterner, out: *?[*]Instr) Par
             'm', 'p', 'r', 'v', 'e', 'd', 't' => {}, // no operand
             'a', 'f', 'j', 'n', 'g', 's', 'P', 'S', 'b', 'F' => {
                 instr.operand = try parseCsexpAtom(ps, g, sym);
+            },
+            // P3 fused ops.  A/K/V carry a prim symbol whose prim_table index
+            // (+1) is resolved AT PARSE into jmp_target (like resolveJumps does
+            // for .prim); Q/R carry the global name symbol and leave
+            // jmp_target zero for the runtime slot cache (like .global).
+            'A' => {
+                const env_idx = try parseCsexpAtom(ps, g, sym); // env index
+                // The .access_prim arm reads operand.payload.number
+                // unconditionally, so a non-number atom is rejected here at
+                // load rather than reading an inactive union field at run.
+                if (env_idx.tag != .number) return error.ParseError;
+                instr.operand = env_idx;
+                instr.jmp_target = try resolvePrimTarget(try parseCsexpAtom(ps, g, sym));
+            },
+            'K' => {
+                instr.operand = try parseCsexpAtom(ps, g, sym); // the literal
+                instr.jmp_target = try resolvePrimTarget(try parseCsexpAtom(ps, g, sym));
+            },
+            'V' => {
+                instr.operand = try parseCsexpAtom(ps, g, sym); // prim name (kept for disassembly)
+                instr.jmp_target = try resolvePrimTarget(instr.operand);
+            },
+            'Q', 'R' => {
+                instr.operand = try parseCsexpAtom(ps, g, sym); // global name
             },
             'c' => {
                 skipWs(ps);
@@ -431,8 +468,12 @@ pub fn resolveJumps(code: [*]Instr, len: i32) void {
             // P1 .global slot cache: jmp_target holds a cached defun slot
             // (idx+1) written at RUNTIME by interp.  Belt-and-braces zero here
             // (already zero from the parse-time std.mem.zeroes) so a fresh
-            // code array always starts uncached.
-            .global => in.jmp_target = 0,
+            // code array always starts uncached.  Q/R (global_apply /
+            // global_appterm) reuse the same runtime slot cache.
+            .global, .global_apply, .global_appterm => in.jmp_target = 0,
+            // P3 A/K/V fused ops: jmp_target was resolved at parse time
+            // (resolvePrimTarget) and must NOT be overwritten here — they fall
+            // through to the else arm below.
             .cur => resolveJumps(@ptrCast(in.closure_code.?), in.closure_len),
             else => {},
         }
@@ -505,6 +546,31 @@ pub fn printInstr(writer: anytype, code: [*]Instr, len: i32, indent: usize) !voi
             },
             .prim => {
                 try writer.writeAll("prim ");
+                try values.printValue(writer, in.operand);
+                try writer.writeAll("\n");
+            },
+            .access_prim => {
+                try writer.writeAll("access_prim ");
+                try values.printValue(writer, in.operand);
+                try writer.print(" (prim tgt={d})\n", .{in.jmp_target});
+            },
+            .const_prim => {
+                try writer.writeAll("const_prim ");
+                try values.printValue(writer, in.operand);
+                try writer.print(" (prim tgt={d})\n", .{in.jmp_target});
+            },
+            .prim_return => {
+                try writer.writeAll("prim_return ");
+                try values.printValue(writer, in.operand);
+                try writer.print(" (prim tgt={d})\n", .{in.jmp_target});
+            },
+            .global_apply => {
+                try writer.writeAll("global_apply ");
+                try values.printValue(writer, in.operand);
+                try writer.writeAll("\n");
+            },
+            .global_appterm => {
+                try writer.writeAll("global_appterm ");
                 try values.printValue(writer, in.operand);
                 try writer.writeAll("\n");
             },

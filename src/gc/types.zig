@@ -87,6 +87,19 @@ pub const Value = extern struct {
 
 /// C: zinctypes.h Opcode — dense enum 0..16.  OP_COUNT=17 kept as `count`
 /// for parity with char_to_opcode's default return.
+///
+/// P3 superinstructions (Zig-native extensions, opcodes >= 18): these are
+/// strict fusions of two existing ops with byte-identical semantics.  Bundles
+/// are TEXT (csexp), so the C text-exchange surface is unaffected; the
+/// original 0..17 values are unchanged, so numeric parity for the C set holds.
+///   access_prim   'A' = access + prim  (loads an env slot then runs a prim)
+///   const_prim    'K' = literal + prim (loads a constant then runs a prim)
+///   prim_return   'V' = prim + return  (runs a prim then returns its result)
+///   global_apply  'Q' = global + apply (looks up a global then applies it)
+///   global_appterm 'R'= global + appterm (looks up a global then tail-calls)
+///   (Numeric order deviates from the artifact-2 spec listing, which puts
+///   global_apply=20: here prim_return=20 comes first — internal-only and
+///   self-consistent, no external numeric consumer.)
 pub const Opcode = enum(u32) {
     access = 0, // OP_ACCESS   'a'
     global = 1, // OP_GLOBAL   'g'
@@ -106,7 +119,12 @@ pub const Opcode = enum(u32) {
     boolean = 15, // OP_BOOLEAN  'b'
     prim = 16, // OP_PRIM     'P'
     float = 17, // OP_FLOAT    'F' (M4)
-    count = 18, // OP_COUNT (sentinel / char_to_opcode default)
+    access_prim = 18, // OP_ACCESS_PRIM  'A' (P3 superinstruction)
+    const_prim = 19, // OP_CONST_PRIM   'K' (P3 superinstruction)
+    prim_return = 20, // OP_PRIM_RETURN  'V' (P3 superinstruction)
+    global_apply = 21, // OP_GLOBAL_APPLY 'Q' (P3 superinstruction)
+    global_appterm = 22, // OP_GLOBAL_APPTERM 'R' (P3 superinstruction)
+    count = 23, // OP_COUNT (sentinel / char_to_opcode default)
 };
 
 /// C: zinctypes.h char_to_opcode — translate a csexp opcode character to the
@@ -131,6 +149,11 @@ pub fn charToOpcode(c: u8) Opcode {
         'b' => .boolean,
         'P' => .prim,
         'F' => .float,
+        'A' => .access_prim,
+        'K' => .const_prim,
+        'V' => .prim_return,
+        'Q' => .global_apply,
+        'R' => .global_appterm,
         else => .count,
     };
 }
@@ -157,6 +180,11 @@ pub fn opcodeToChar(op: Opcode) u8 {
         .boolean => 'b',
         .prim => 'P',
         .float => 'F',
+        .access_prim => 'A',
+        .const_prim => 'K',
+        .prim_return => 'V',
+        .global_apply => 'Q',
+        .global_appterm => 'R',
         .count => '?',
     };
 }

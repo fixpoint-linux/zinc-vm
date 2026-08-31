@@ -728,7 +728,7 @@ pub fn vmExecEnv(
         const cur_many: [*]types.Instr = @ptrCast(cur_code.?);
         const in: *types.Instr = &cur_many[@intCast(pc)];
 
-        switch (in.op) {
+        dispatch: switch (in.op) {
             // C:3230-3232 — literal loads.
             .number, .string, .symbol, .boolean, .float => {
                 acc = in.operand;
@@ -757,6 +757,22 @@ pub fn vmExecEnv(
                         error.ShenError => return error.ShenError,
                     };
                 }
+                vaPush(g, &stack, acc);
+                pc += 1;
+            },
+
+            // P3 K = const + prim: the literal-load arm (acc = operand,
+            // vaPush) followed VERBATIM by the .prim fast path.  jmp_target
+            // holds the parse-resolved prim_table index + 1 (never 0 — an
+            // unknown prim is a ParseError at parse time), so the by-name
+            // fallback is unreachable here.
+            .const_prim => {
+                acc = in.operand;
+                vaPush(g, &stack, acc);
+                prims.primByIndex(@intCast(in.jmp_target - 1)).func(vm, &acc, &stack) catch |e| switch (e) {
+                    error.Halt => break :run,
+                    error.ShenError => return error.ShenError,
+                };
                 vaPush(g, &stack, acc);
                 pc += 1;
             },
@@ -961,6 +977,32 @@ pub fn vmExecEnv(
                 )) break :run;
             },
 
+            // P3 V = prim + return: the .prim fast path followed by the .ret
+            // frame-restore body.  The .prim arm's vaPush(acc) between the
+            // prim call and the frame pop is a no-op here — popFramePushAcc
+            // releases the current stack and pushes acc to the CALLER's
+            // stack, so the just-pushed result was always discarded.  V skips
+            // it: byte-identical observable behavior.
+            .prim_return => {
+                prims.primByIndex(@intCast(in.jmp_target - 1)).func(vm, &acc, &stack) catch |e| switch (e) {
+                    error.Halt => break :run,
+                    error.ShenError => return error.ShenError,
+                };
+                if (!popFramePushAcc(
+                    vm,
+                    acc,
+                    frame_stack,
+                    &frames_sp,
+                    &cur_code,
+                    &cur_len,
+                    &pc,
+                    &env,
+                    &env_len,
+                    &env_cap,
+                    &stack,
+                )) break :run;
+            },
+
             // C:3361-3364 — access.
             .access => {
                 const n: i32 = if (in.operand.tag == .number)
@@ -968,6 +1010,25 @@ pub fn vmExecEnv(
                 else
                     in.jmp_target;
                 acc = lookupEnv(n, env, env_len);
+                vaPush(g, &stack, acc);
+                pc += 1;
+            },
+
+            // P3 A = access + prim: the .access body (env slot -> acc ->
+            // vaPush) followed VERBATIM by the .prim fast path.  Unlike
+            // .access, jmp_target holds the prim_table index + 1 (NOT the env
+            // index), so the env index is read from the number operand alone —
+            // the `else in.jmp_target` fallback of .access would wrongly use
+            // the prim index and is deliberately dropped (the operand is
+            // always a number atom: parser.zig rejects non-number A operands
+            // at load).
+            .access_prim => {
+                acc = lookupEnv(@intCast(in.operand.payload.number), env, env_len);
+                vaPush(g, &stack, acc);
+                prims.primByIndex(@intCast(in.jmp_target - 1)).func(vm, &acc, &stack) catch |e| switch (e) {
+                    error.Halt => break :run,
+                    error.ShenError => return error.ShenError,
+                };
                 vaPush(g, &stack, acc);
                 pc += 1;
             },
@@ -997,6 +1058,65 @@ pub fn vmExecEnv(
                 }
                 vaPush(g, &stack, acc);
                 pc += 1;
+            },
+
+            // P3 Q = global + apply.  The .global body (P1 slot-cache
+            // read/write included) followed by vaPush(acc), then a
+            // labeled-switch continue into the EXISTING .apply arm — zero
+            // duplication of the apply logic.  pc is deliberately NOT
+            // incremented: .apply reads `pc` to compute its return address
+            // (cf.pc = pc + 1) and for the partial/prim paths (pc += 1), so
+            // leaving pc on the Q slot makes every path compute the same
+            // address as the unfused `g name; p` sequence.
+            //
+            // PITFALL-8 (continue value subtlety): `continue :dispatch .apply`
+            // does NOT re-read in.op — the continue value IS the operand.  The
+            // .apply arm never dereferences `in`, so the `in` pointer may be
+            // stale after vaPush grew the stack (a collect may have moved the
+            // code array); nothing here reads `in` after vaPush either.
+            .global_apply => {
+                const nm = if (in.operand.tag == .symbol) values.symSlice(in.operand) else "";
+                if (in.jmp_target > 0) {
+                    const e = &vm.defun_table[@intCast(in.jmp_target - 1)];
+                    if (e.name != null and std.mem.eql(u8, std.mem.sliceTo(e.name.?, 0), nm)) {
+                        acc = e.value;
+                        vaPush(g, &stack, acc);
+                        continue :dispatch .apply;
+                    }
+                }
+                acc = try vm.defunGetChecked(nm);
+                if (nm.len > 0) {
+                    if (tables.defunLookupSlot(vm.defun_table, tables.DEFUN_TABLE_CAP, nm)) |sl| {
+                        in.jmp_target = @intCast(sl.idx + 1);
+                    }
+                }
+                vaPush(g, &stack, acc);
+                continue :dispatch .apply;
+            },
+
+            // P3 R = global + appterm.  Same shape as Q: the .global body,
+            // vaPush(acc), then continue into the existing .appterm arm.  The
+            // .appterm arm never dereferences `in` and sets pc = 0 (tail jump)
+            // or restores it from the caller frame (popFramePushAcc), so the
+            // stale-`in` / non-incremented-pc reasoning above applies verbatim.
+            .global_appterm => {
+                const nm = if (in.operand.tag == .symbol) values.symSlice(in.operand) else "";
+                if (in.jmp_target > 0) {
+                    const e = &vm.defun_table[@intCast(in.jmp_target - 1)];
+                    if (e.name != null and std.mem.eql(u8, std.mem.sliceTo(e.name.?, 0), nm)) {
+                        acc = e.value;
+                        vaPush(g, &stack, acc);
+                        continue :dispatch .appterm;
+                    }
+                }
+                acc = try vm.defunGetChecked(nm);
+                if (nm.len > 0) {
+                    if (tables.defunLookupSlot(vm.defun_table, tables.DEFUN_TABLE_CAP, nm)) |sl| {
+                        in.jmp_target = @intCast(sl.idx + 1);
+                    }
+                }
+                vaPush(g, &stack, acc);
+                continue :dispatch .appterm;
             },
 
             // C:3379-3383 — let: bind the stack top (or acc).

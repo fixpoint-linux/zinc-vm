@@ -1775,6 +1775,94 @@ test "M5 zinctest 37/38: appterm hard stops preserve acc (the closure)" {
     try std.testing.expectEqual(types.ValTag.lambda, r38.tag);
 }
 
+// =====================================================================
+//  P3 — superinstruction parity (A/K/V/Q/R fused ops)
+// =====================================================================
+
+test "P3 superinstruction parity: fused == unfused for every op" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // A = access + prim (closure body: a 0; P hdstr; v over "hi" -> "h").
+    try expectRunStr(&g, &v, "(mS[2:S]hic(a[1:n]0P[5:s]hdstrv)t)", "h");
+    try expectRunStr(&g, &v, "(mS[2:S]hic(A[1:n]0[5:s]hdstrv)t)", "h");
+
+    // K = const + prim (number 42 then number? -> true).
+    try expectRunBool(&g, &v, "(n[2:n]42P[7:s]number?v)", true);
+    try expectRunBool(&g, &v, "(K[2:n]42[7:s]number?v)", true);
+
+    // V = prim + return (number? with 42 already pushed -> true).
+    try expectRunBool(&g, &v, "(n[2:n]42P[7:s]number?v)", true);
+    try expectRunBool(&g, &v, "(n[2:n]42V[7:s]number?)", true);
+
+    // Q = global + apply ([+ 1 2] -> 3).
+    try expectRunNum(&g, &v, "(mn[1:n]2n[1:n]1g[1:s]+p)", 3);
+    try expectRunNum(&g, &v, "(mn[1:n]2n[1:n]1Q[1:s]+)", 3);
+
+    // R = global + appterm ([+ 1 2] tail -> 3).
+    try expectRunNum(&g, &v, "(mn[1:n]2n[1:n]1g[1:s]+t)", 3);
+    try expectRunNum(&g, &v, "(mn[1:n]2n[1:n]1R[1:s]+)", 3);
+}
+
+test "P3 superinstruction parity: error-throwing prim routes identically" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // A fused over simple-error runs the prim AFTER the access load and its
+    // ShenError routes through the same catch (no extra pushes/roots of the
+    // fused arm's own) — err_slot message identical to the unfused spelling.
+    try std.testing.expectError(error.ShenError, expectRunVal(&g, &v, "(mS[4:S]boomc(a[1:n]0P[12:s]simple-errorv)t)"));
+    try std.testing.expectEqualStrings("boom", std.mem.sliceTo(v.err_slot.payload.error_.message.?, 0));
+    try std.testing.expectError(error.ShenError, expectRunVal(&g, &v, "(mS[4:S]boomc(A[1:n]0[12:s]simple-errorv)t)"));
+    try std.testing.expectEqualStrings("boom", std.mem.sliceTo(v.err_slot.payload.error_.message.?, 0));
+}
+
+test "P3 fused-op prim resolution round-trips every prim_table entry" {
+    var g = try testInit();
+    defer g.deinit();
+    var sym = symbols.SymbolInterner.init();
+    defer sym.deinit();
+
+    // Every prim_table name must resolve through a fused op (the Elm compiler
+    // emits fused ops for its own prim subset; this asserts the FULL table
+    // resolves so a compiler/VM drift can never silently fall back).
+    for (prims.prim_table, 0..) |def, i| {
+        const nm = std.mem.sliceTo(def.name, 0);
+        var buf: [256]u8 = undefined;
+        const src = std.fmt.bufPrintZ(&buf, "(A[1:n]0 [{d}:s]{s})", .{ nm.len, nm }) catch unreachable;
+        var code: ?[*]types.Instr = null;
+        const len = try parser.parseBytecode(&g, &sym, src, &code);
+        try std.testing.expectEqual(@as(i32, 1), len);
+        try std.testing.expectEqual(types.Opcode.access_prim, code.?[0].op);
+        try std.testing.expectEqual(@as(i32, @intCast(i + 1)), code.?[0].jmp_target);
+    }
+}
+
+test "P3 unknown prim in a fused op is a ParseError" {
+    var g = try testInit();
+    defer g.deinit();
+    var sym = symbols.SymbolInterner.init();
+    defer sym.deinit();
+
+    // Unknown prim name in a fused op -> ParseError (drift surfaced at load).
+    var code: ?[*]types.Instr = null;
+    try std.testing.expectError(error.ParseError, parser.parseBytecode(&g, &sym, "(A[1:n]0[10:s]frobnicate)", &code));
+    try std.testing.expect(code == null);
+    // Non-symbol prim atom in a fused op -> ParseError too.
+    try std.testing.expectError(error.ParseError, parser.parseBytecode(&g, &sym, "(A[1:n]0[1:n]5)", &code));
+    try std.testing.expect(code == null);
+    // Non-number env-index atom in A -> ParseError (the .access_prim arm reads
+    // operand.payload.number unconditionally; rejected at load, never run).
+    try std.testing.expectError(error.ParseError, parser.parseBytecode(&g, &sym, "(A[1:s]x[5:s]hdstr)", &code));
+    try std.testing.expect(code == null);
+}
+
 test "M5 unknown prim hard-stops (C: print + return -1)" {
     var g = try testInit();
     defer g.deinit();
