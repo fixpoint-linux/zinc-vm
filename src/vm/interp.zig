@@ -350,7 +350,7 @@ fn popFramePushAcc(
 ///   - ALLOC#3 (the closure's env copy) happens INSIDE valLambda, which
 ///     roots its own code/env slot copies; no alloc occurs between the
 ///     fill above and its prologue pushes.
-fn buildPartialClosure(g: *Gc, fnv_slot: *Value, argbuf: [*]Value, nargs: i32) Value {
+pub fn buildPartialClosure(g: *Gc, fnv_slot: *Value, argbuf: [*]Value, nargs: i32) Value {
     const code_len = fnv_slot.payload.lambda.code_len; // i32 — GC-invariant
     const new_len = code_len - nargs; // drop-grabs nargs
     // ALLOC#1 — fresh instr_array holding the suffix [nargs..code_len).
@@ -443,7 +443,7 @@ fn buildPartialClosure(g: *Gc, fnv_slot: *Value, argbuf: [*]Value, nargs: i32) V
 /// own roots).  The env concat is filled and handed straight to vmExecEnv
 /// with NO alloc in between — the callee's prologue roots init_env at its
 /// slot (2) before its first allocation (primTrapError precedent).
-fn peelOverArgs(
+pub fn peelOverArgs(
     vm: *Vm,
     acc_slot: *Value,
     argbuf: *[64]Value,

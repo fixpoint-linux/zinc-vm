@@ -225,6 +225,12 @@ pub const Gc = struct {
     full_collect_count: u64 = 0,
     /// C: gc.c:296 gc_alloc_class_count[5], indexed by GcTypeTag value.
     alloc_class_count: [5]u64 = [_]u64{0} ** 5,
+    /// AOT elision backstop (tools/aot): incremented per gc_alloc in Debug
+    /// only (comptime-gated out of release), so an elided NON_ALLOCATING fn
+    /// can assert at entry/exit that this count is unchanged — a collection
+    /// can only start inside gc_alloc, so a stable count proves no collect
+    /// fired and unrooted locals could never have moved.
+    debug_allocs: u64 = 0,
     dirty_vectors_fired: u64 = 0,
     dirty_defuns_fired: u64 = 0,
     dirty_defuns_scanned: u64 = 0,
@@ -709,6 +715,11 @@ pub const Gc = struct {
         // always in [0,4]; C guards against stray int tags).
         self.alloc_class_count[@intFromEnum(type_tag)] += 1;
 
+        // AOT elision backstop: Debug-only allocation counter (compiled out
+        // in ReleaseFast/Small — the elided-fn assert reads the field but the
+        // increment is comptime-gated, keeping release allocation unchanged).
+        if (@import("builtin").mode == .Debug) self.debug_allocs += 1;
+
         // C: gc.c:2171-2172 — nursery eligibility: bytes <= NURSERY_BYTES/8
         // AND the padded total (header + body, words) fits in ONE page.
         if (bytes <= NURSERY_BYTES / 8 and
@@ -814,6 +825,12 @@ pub const Gc = struct {
     pub noinline fn gc_alloc_oldgen(self: *Gc, bytes: usize, type_tag: types.GcTypeTag) [*]u8 {
         // C: gc.c:2286.
         self.alloc_class_count[@intFromEnum(type_tag)] += 1;
+
+        // AOT elision backstop: same Debug-only counter as gc_alloc — this
+        // path can trigger collect(.alloc) at its THRESHOLD check below, so
+        // it must be counted for the "a collection can only start inside a
+        // counted public alloc" invariant to hold.
+        if (@import("builtin").mode == .Debug) self.debug_allocs += 1;
 
         if (self.allocatedpages > 0 and
             self.allocatedpages > self.oldgen_collect_threshold() and
