@@ -1126,6 +1126,13 @@ fn primTrapError(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
         }
     }
     henv[@intCast(env_len)] = err;
+    // Net-removal barrier (M5): `err` can hold nursery refs and `henv` can be
+    // old-gen (env_len+1 >= 13); this err store is the LAST store into henv
+    // (the handler-env copy above barriers its own batch) and has no barrier.
+    // Without it, a scavenge recycles err's nursery refs while the old-gen
+    // henv still references them.
+    if (g.inOldgen(@intFromPtr(henv)) and gc.scan.valueReferencesNursery(g, &err))
+        g.dirtyVectorsAdd(henv);
     const hc = handler.payload.lambda.code;
     const hl = handler.payload.lambda.code_len;
     g.rootPop(); // err

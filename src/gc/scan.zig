@@ -74,6 +74,16 @@ pub fn evacInstr(gc: *Gc, in: *types.Instr) void {
     evacuate(gc, @ptrCast(&in.closure_code));
 }
 
+/// Nursery-reference predicate for a single Instr — the barrier mirror of
+/// evacInstr: true iff the operand Value references a nursery object OR
+/// closure_code points into the nursery.  Must mirror evacInstr EXACTLY
+/// (operand via valueReferencesNursery, closure_code via the raw pointer
+/// word; a null closure_code reads as 0 and inNursery(0) is false).
+pub fn instrReferencesNursery(gc: *const Gc, in: *const types.Instr) bool {
+    return valueReferencesNursery(gc, &in.operand) or
+        gc.inNursery(@as(*const usize, @ptrCast(&in.closure_code)).*);
+}
+
 /// C: zincvm.c:112-121 value_references_nursery — true iff `v` references any GC
 /// object in the nursery.  Must mirror EXACTLY the pointer fields gc_scan_value
 /// evacuates.  NULL-safe: cons/lambda fields pass a null pointer through

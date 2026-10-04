@@ -285,6 +285,22 @@ fn parseBody(ps: *ParseState, g: *Gc, sym: *SymbolInterner, out: *?[*]Instr) Par
         }
     }
 
+    // Net-removal barrier (M5): the re-wrap loop above planted FRESH nursery
+    // str.data pointers into the (possibly old-gen) code array AFTER the
+    // memcpy site, so the code array must be (re-)barriered HERE — after the
+    // LAST such store — or a later scavenge recycles those strings while the
+    // old-gen instr_array still references them.  instrReferencesNursery
+    // mirrors evacInstr (operand via valueReferencesNursery, closure_code via
+    // the raw word), so a cur's nursery child is also caught.
+    if (g.inOldgen(@intFromPtr(code))) {
+        for (code[0..scratch.items.len]) |*ins| {
+            if (gc.scan.instrReferencesNursery(g, ins)) {
+                g.dirtyVectorsAdd(@ptrCast(code));
+                break;
+            }
+        }
+    }
+
     g.rootPop(); // code_slot
 
     // Pop and free the N cc slots (C:2956-2965).  Pushed order slot0..slotN

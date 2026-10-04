@@ -127,18 +127,19 @@ pub fn rootPushValueArray(gc: *Gc, base: [*]types.Value, np: *i32) void {
     gc.shadow_len += 1;
 }
 
-/// C: gc.c:2399-2402 gc_root_push_callframe_array.  ROOT_CALLFRAME_ARRAY is
-/// deliberately a no-op at scan time: the Cheney drain scans CallFrame arrays
-/// via the GC_TYPE_CALLFRAME_ARRAY case once their page is queued (the
-/// frame_stack is rooted separately as ROOT_PTR).  An explicit walker here
-/// would be redundant AND could crash during Phase-0 promotion if a
-/// stack.data pointer reads a zero/invalid header — see C: gc.c:1560-1569
-/// (Bug #6, "gcalloc: object too large").
-pub fn rootPushCallframeArray(gc: *Gc, arr: [*]types.CallFrame, np: *i32) void {
+/// C: gc.c:2399-2402 gc_root_push_callframe_array.  ROOT_CALLFRAME_ARRAY
+/// records the ADDRESS of the frame_stack pointer variable (like ROOT_PTR) plus
+/// the live element count: the frame_stack is a GC array that MOVES every full
+/// collect, so a registration-time copy of its base would go stale.  scanRoots
+/// reads through `arr_slot` to get the current base and scans only the LIVE
+/// range [0..*np) — see collect.zig.  (The C original kept this a no-op and
+/// relied on the gcMove page queue; net-removal makes the live scan load-
+/// bearing.)
+pub fn rootPushCallframeArray(gc: *Gc, arr_slot: *[*]types.CallFrame, np: *i32) void {
     if (gc.shadow_len >= gc.shadow_cap) shadowStackGrow(gc);
     gc.shadow_stack[gc.shadow_len] = .{
         .kind = .ROOT_CALLFRAME_ARRAY,
-        .slot = @ptrFromInt(@intFromPtr(arr)),
+        .slot = @ptrFromInt(@intFromPtr(arr_slot)),
         .np = np,
     };
     gc.shadow_len += 1;

@@ -94,11 +94,14 @@ pub fn gcMove(gc: *Gc, p: ?*anyopaque) ?*anyopaque {
     // pointers such as C-heap strdup'd strings pass through unchanged.)
     if (page < gc.firstheappage or page > gc.lastheappage) return p;
 
-    // C: gc.c:2021-2028 — already in to-space.  During a nursery scavenge,
-    // old-gen objects (space == current == next) must be queued for scanning
-    // since their bodies may contain nursery pointers.
+    // C: gc.c:2021-2028 — already in to-space.  NET-REMOVAL (M5): the
+    // `if (gc.in_scavenge) gc.queue(page);` that used to sit here queued every
+    // old-gen page reached during a scavenge so the drain would scan its
+    // interior for nursery pointers — that was the O(old-gen) net.  It is
+    // DELETED: old-gen interiors are now scanned ONLY via the write-barrier
+    // remembered set (scanDirtyVectors) and the ROOT_CALLFRAME_ARRAY live scan,
+    // making a nursery scavenge O(roots + nursery-live + dirty-entries).
     if (gc.space[gc.md(page)] == gc.next_space) {
-        if (gc.in_scavenge) gc.queue(page);
         return p;
     }
 
@@ -327,12 +330,39 @@ fn scanRoots(gc: *Gc) void {
                     scan.scanValue(gc, &base[j]);
             },
             .ROOT_CALLFRAME_ARRAY => {
-                // C: gc.c:1560-1569 — deliberate no-op: CallFrame headers are
-                // evacuated by the Cheney drain's GC_TYPE_CALLFRAME_ARRAY
-                // case once their page is queued (frame_stack is rooted as
-                // ROOT_PTR).  An explicit walker here is redundant and can
-                // crash during Phase-0 promotion if stack.data reads a
-                // zero/invalid header (Bug #6).
+                // Net-removal (M5): scan the LIVE range [0..*np) of the frame
+                // stack, evacuating each live frame's code/env/stack.data in
+                // place (the same slot set as drainScanObject case 4).  This
+                // replaces the gcMove old-gen page queue as frame_stack's
+                // interior scan.  It is only needed in scavenge-mode phases —
+                // Phase-0 (in_scavenge=1) and collectNursery — where the
+                // old-gen frame_stack does NOT move, so the drain cannot reach
+                // its interior.  In the full collect's main scavenge the
+                // frame_stack IS moved (root 8 -> moveInternal queues its
+                // to-space pages), so the drain scans it via case 4 and an
+                // explicit walker here would be redundant.
+                //
+                // The slot holds the ADDRESS of the frame_stack pointer (the
+                // same location root 8 evacuates), NOT the array base: the
+                // base moves every full collect, so a registration-time copy
+                // would go stale and scan freed memory.  Reading through the
+                // pointer slot yields the CURRENT base.  The bound is *np
+                // (frames_sp) read live, exactly like ROOT_VALUE_ARRAY.  The
+                // old full-capacity drain could read a zero/invalid stack.data
+                // header in a DEAD slot (Bug #6); scanning only [0..*np) is
+                // safe because the interpreter null-clears a popped slot
+                // before the next collection can observe it.
+                if (gc.in_scavenge) {
+                    const arr_slot: *[*]types.CallFrame = @ptrCast(@alignCast(r.slot));
+                    const base: [*]types.CallFrame = arr_slot.*;
+                    const n = r.np.?.*;
+                    var j: usize = 0;
+                    while (j < @as(usize, @intCast(n))) : (j += 1) {
+                        scan.evacuate(gc, @ptrCast(&base[j].code));
+                        scan.evacuate(gc, @ptrCast(&base[j].env));
+                        scan.evacuate(gc, @ptrCast(&base[j].stack.data));
+                    }
+                }
             },
         }
     }
@@ -379,6 +409,61 @@ fn scanRoots(gc: *Gc) void {
         while (k < n) : (k += 1) {
             if (tc[k] != null)
                 scan.evacuate(gc, @ptrCast(&tc[k]));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Dirty-vector remembered-set scan — C: gc.c:1668-1687 ----
+// ---------------------------------------------------------------------
+
+/// Scan the write-barrier remembered set (dirty_vectors), the net-removal
+/// interior scan: old-gen containers holding nursery pointers are promoted
+/// here, not via the gcMove page queue.  Every recorded old-gen container is
+/// dispatched by its HEADER TAG to the shared drainScanObject (value_array /
+/// instr_array / callframe_array each scan their element class; raw is a
+/// no-op).
+///
+/// On overflow (dirtyVectorsAdd hit the cap, so the set is incomplete), the
+/// remembered set is abandoned and EVERY old-gen OBJECT page in current_space
+/// is queued for the drain to scan — O(old-gen) for one cycle but CORRECT.
+/// This is safe in BOTH call sites because during a scavenge / Phase-0 the
+/// old-gen objects are in current_space == next_space and do NOT move (so the
+/// queued pages carry no forwarding pointers).
+///
+/// NOTE: `data` is old-gen (inOldgen = SPACE TAG test, gc.c:338-342 — NOT an
+/// address-range test: an address-range version silently misses
+/// promoted-in-place arrays and wrongly includes dead from-space pages), so it
+/// cannot move during this scavenge and the cached pointer stays valid across
+/// the whole loop.
+fn scanDirtyVectors(gc: *Gc) void {
+    if (gc.dirty_vectors_overflow) {
+        // C: gc.c:1669-1674 — overflow valve tripped (gc.c:361-364): queue
+        // every old-gen OBJECT page.  Starts past the nursery region (which is
+        // never tagged current_space anyway).
+        var pg = gc.nursery_last + 1;
+        while (pg <= gc.lastheappage) : (pg += 1) {
+            if (gc.space[gc.md(pg)] == gc.current_space and
+                gc.type_page[gc.md(pg)] == heap.OBJECT)
+            {
+                gc.queue(pg);
+            }
+        }
+    } else {
+        // C: gc.c:1675-1686 — scan each remembered array inline, dispatched by
+        // header tag via the shared drain.
+        var k: usize = 0;
+        while (k < gc.dirty_vectors_count) : (k += 1) {
+            const data = gc.dirty_vectors[k];
+            if (!gc.inOldgen(@intFromPtr(data))) continue; // C: gc.c:1677
+            const body: [*]usize = @ptrCast(data);
+            const header = (body - 1)[0]; // C: `(uintptr_t *)data - 1`
+            const ty = types.headerType(header);
+            // Widened tag dispatch (net-removal): value_array, instr_array and
+            // callframe_array containers all reach the remembered set now; raw
+            // carries no pointers and anything else is a false-positive header.
+            if (ty > @intFromEnum(types.GcTypeTag.callframe_array)) continue; // C: gc.c:1680
+            drainScanObject(gc, body, ty, types.headerWords(header));
         }
     }
 }
@@ -465,6 +550,16 @@ pub fn collect(gc: *Gc, trigger: Trigger) void {
                     scan.scanValue(gc, &vt[k].value);
             }
         }
+
+        // Net-removal (M5): Phase-0 also depends on the gcMove old-gen page
+        // queue for interior scanning of old-gen containers holding nursery
+        // refs.  With the net gone, scan the write-barrier remembered set here
+        // (before the drain) so those nursery survivors are promoted before
+        // the semi-space flip — otherwise they stay nursery-resident and their
+        // old-gen refs go stale after the flip.  dirty_vectors is still
+        // populated at full-collect time (cleared only at scavenge end and at
+        // collect()'s :488 flip).
+        scanDirtyVectors(gc);
 
         // C: gc.c:680-682 — shared drain with the deferred-resume policy.
         cheneyDrain(gc);
@@ -596,43 +691,9 @@ pub fn collectNursery(gc: *Gc, trigger: Trigger) void {
 
     // ---- scan dirty old-gen vectors (write-barrier remembered set) —
     // C: gc.c:1668-1687 ----
-    if (gc.dirty_vectors_overflow) {
-        // C: gc.c:1669-1674 — overflow valve tripped (gc.c:361-364): the
-        // remembered set is incomplete, so fall back to queuing EVERY
-        // old-gen OBJECT page in current_space and letting the drain scan
-        // them all.  Starts past the nursery region (which is never tagged
-        // current_space anyway) — C iterates nursery_last+1..lastheappage.
-        var pg = gc.nursery_last + 1;
-        while (pg <= gc.lastheappage) : (pg += 1) {
-            if (gc.space[gc.md(pg)] == gc.current_space and
-                gc.type_page[gc.md(pg)] == heap.OBJECT)
-            {
-                gc.queue(pg);
-            }
-        }
-    } else {
-        // C: gc.c:1675-1686 — scan each remembered array inline.
-        // NOTE: `data` is old-gen (inOldgen = SPACE TAG test, gc.c:338-342 —
-        // NOT an address-range test: an address-range version silently
-        // misses promoted-in-place arrays and wrongly includes dead
-        // from-space pages), so it cannot move during this scavenge and the
-        // cached pointer stays valid across the whole loop.
-        var k: usize = 0;
-        while (k < gc.dirty_vectors_count) : (k += 1) {
-            const data = gc.dirty_vectors[k];
-            if (!gc.inOldgen(@intFromPtr(data))) continue; // C: gc.c:1677
-            const cp: [*]usize = @ptrCast(data);
-            const header = (cp - 1)[0]; // C: `(uintptr_t *)data - 1`
-            const ty = types.headerType(header);
-            if (ty != @intFromEnum(types.GcTypeTag.value_array)) continue; // C: gc.c:1680
-            const hw = types.headerWords(header);
-            const body_bytes = (hw - 1) * heap.WORDBYTES;
-            const count = body_bytes / @sizeOf(types.Value);
-            var j: usize = 0;
-            while (j < count) : (j += 1)
-                scan.scanValue(gc, &data[j]); // C: gc.c:1685
-        }
-    }
+    // Handles both the normal per-tag scan and the overflow fallback (see
+    // scanDirtyVectors).
+    scanDirtyVectors(gc);
 
     // ---- Cheney scavenge — C: gc.c:1698 ----
     // Nursery survivors are copied to old-gen (gcMove nursery branch →

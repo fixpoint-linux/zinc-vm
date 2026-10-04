@@ -62,7 +62,15 @@ pub const MIN_HEAP_PAGES = 32768;
 pub const MIN_HEAP_BYTES = MIN_HEAP_PAGES * PAGEBYTES;
 
 /// C: gc.c:351 DIRTY_VECTORS_MAX — remembered-set capacity valve.
-pub const DIRTY_VECTORS_MAX = 8192;
+/// Net-removal (M5): raised 8192 -> 65536.  The remembered set now carries the
+/// full old-gen->nursery edge population that the removed gcMove page queue
+/// used to rescue (not just the value_array subset), so the distinct-array
+/// count per scavenge can be far higher than the old ~410 average.  65536 x 8B
+/// = 512KB max metadata, trivial vs the multi-GB heap.  The overflow valve is
+/// unchanged: if this ever trips, the scavenge falls back to the full old-gen
+/// page queue (correct, just O(old-gen) for one cycle) and the stats line
+/// reports dirty_vectors_overflow=true as the alarm.
+pub const DIRTY_VECTORS_MAX = 65536;
 
 /// P2-10: the dirty-vectors dedup index capacity (open addressing wants
 /// headroom, so 2x the array cap) and the linear-scan/hash handoff
@@ -1210,9 +1218,11 @@ pub const Gc = struct {
         roots_mod.rootPushValueArray(self, base, np);
     }
 
-    /// C: gc.c:2399 gc_root_push_callframe_array.
-    pub fn rootPushCallframeArray(self: *Gc, arr: [*]types.CallFrame, np: *i32) void {
-        roots_mod.rootPushCallframeArray(self, arr, np);
+    /// C: gc.c:2399 gc_root_push_callframe_array.  `arr_slot` is the ADDRESS of
+    /// the frame_stack pointer variable (the array base moves every full
+    /// collect — see roots.zig).
+    pub fn rootPushCallframeArray(self: *Gc, arr_slot: *[*]types.CallFrame, np: *i32) void {
+        roots_mod.rootPushCallframeArray(self, arr_slot, np);
     }
 
     /// C: gc.c:2372 gc_root_pop.
@@ -1261,8 +1271,8 @@ pub const Gc = struct {
     }
 
     /// SAFETY-ENFORCEMENT (unit D): RAII guard for a CallFrame array root.
-    pub fn rootCallframeArray(self: *Gc, arr: [*]types.CallFrame, np: *i32) roots_mod.RootGuard {
-        self.rootPushCallframeArray(arr, np);
+    pub fn rootCallframeArray(self: *Gc, arr_slot: *[*]types.CallFrame, np: *i32) roots_mod.RootGuard {
+        self.rootPushCallframeArray(arr_slot, np);
         return .{ .gc = self };
     }
 

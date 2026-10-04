@@ -662,10 +662,12 @@ pub fn vmExecEnv(
     var frame_stack: [*]types.CallFrame = frameStackAcquire(vm);
     // C allocates a GC-heap int for frames_sp so it survives longjmp
     // (C:3186-3188).  Zig error unwinding runs defers before this frame
-    // dies, so a plain native local is safe (plan DECISION A); the
-    // ROOT_CALLFRAME_ARRAY np below is never dereferenced at scan time.
+    // dies, so a plain native local is safe (plan DECISION A): the
+    // ROOT_CALLFRAME_ARRAY's np (&frames_sp) and the frame_stack pointer slot
+    // (&frame_stack) are both read live during a collect, which can only run
+    // while this vmExecEnv frame is still on the C stack.
     var frames_sp: i32 = 0;
-    g.rootPushCallframeArray(frame_stack, &frames_sp); // (6) — C:3195
+    g.rootPushCallframeArray(&frame_stack, &frames_sp); // (6) — C:3195
     // Release the frame stack back to the pool on EVERY exit.  Registered
     // AFTER the rootPopTo(entry_wm) defer above, so defers run it FIRST
     // (reverse order) while root (8) below still pins frame_stack, and
